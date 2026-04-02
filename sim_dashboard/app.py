@@ -752,8 +752,22 @@ def make_figure(
 
         x0 = pd.to_datetime(order["start_ts_us"], unit="us")
         x1 = pd.to_datetime(order["end_ts_us"], unit="us")
-        x_mid = x0 + (x1 - x0) / 2
         y = order["price"]
+        if x1 <= x0:
+            order_x = [x0]
+        else:
+            # Dense sampling makes the full order span easy to click without needing a second click.
+            duration_seconds = max((x1 - x0).total_seconds(), 0.0)
+            sample_count = max(25, min(200, int(duration_seconds) + 2))
+            step = (x1 - x0) / (sample_count - 1)
+            order_x = [x0 + step * i for i in range(sample_count)]
+        order_hover = (
+            f"parent_order_id={order.get('parent_order_id', '')}<br>"
+            f"client_order_id={order['client_order_id']}<br>"
+            f"side={side}<br>"
+            f"size={'' if order.get('size') is None else order.get('size')}<br>"
+            f"price={y}<extra></extra>"
+        )
         fig.add_trace(
             go.Scatter(
                 x=[x0, x1],
@@ -763,24 +777,18 @@ def make_figure(
                 showlegend=False,
                 line={"color": color, "width": 3.4},
                 customdata=[str(order.get("parent_order_id") or ""), str(order.get("parent_order_id") or "")],
-                hoverinfo="skip",
+                hovertemplate=order_hover,
             )
         )
         fig.add_trace(
             go.Scatter(
-                x=[x_mid],
-                y=[y],
+                x=order_x,
+                y=[y] * len(order_x),
                 mode="markers",
                 showlegend=False,
-                marker={"size": 16, "color": "rgba(0,0,0,0)"},
-                customdata=[str(order.get("parent_order_id") or "")],
-                hovertemplate=(
-                    f"parent_order_id={order.get('parent_order_id', '')}<br>"
-                    f"client_order_id={order['client_order_id']}<br>"
-                    f"side={side}<br>"
-                    f"size={'' if order.get('size') is None else order.get('size')}<br>"
-                    f"price={y}<extra></extra>"
-                ),
+                marker={"size": 18, "color": color, "opacity": 0.001},
+                customdata=[str(order.get("parent_order_id") or "")] * len(order_x),
+                hovertemplate=order_hover,
             )
         )
 
@@ -891,6 +899,7 @@ def make_figure(
         template="plotly_white",
         height=760,
         title="Orders / Fills" if not show_book else "Orders / Bid-Ask",
+        clickmode="event",
         hovermode="closest",
         hoverdistance=20,
         yaxis2={
@@ -1048,7 +1057,6 @@ def render_parent(search: str) -> html.Div:
     head_raw = unquote(query.get("head", [""])[0])
     symbol = unquote(query.get("symbol", [""])[0])
     date = query.get("date", [""])[0]
-    hour_raw = unquote(query.get("hour", [""])[0])
     parent_order_id = unquote(query.get("parent_order_id", [""])[0])
 
     head = normalize_head(head_raw)
@@ -1112,7 +1120,7 @@ def render_parent(search: str) -> html.Div:
         date,
         window_start,
         window_end,
-        show_book=False,
+        show_book=True,
     )
     position_fig = make_position_figure(position_df, symbol, head, date, window_start, window_end)
     initial_interval_text = format_interval_label(window_start, window_end)
@@ -1162,7 +1170,12 @@ def render_parent(search: str) -> html.Div:
 
 app = dash.Dash(__name__, suppress_callback_exceptions=True)
 app.title = "Simulation Dashboard"
-app.layout = html.Div([dcc.Location(id="url"), html.Div(id="page-content")])
+app.layout = html.Div(
+    [
+        dcc.Location(id="url"),
+        html.Div(id="page-content"),
+    ]
+)
 
 
 @app.callback(Output("page-content", "children"), Input("url", "pathname"), Input("url", "search"))
@@ -1176,94 +1189,102 @@ def route(pathname: str, search: str):
     return render_index()
 
 
-@app.callback(
-    Output("url", "pathname"),
-    Output("url", "search"),
+app.clientside_callback(
+    """
+    function(hourValue, dayNavMeta) {
+        const noUpdate = window.dash_clientside.no_update;
+        if (!hourValue || hourValue === "all") {
+            return noUpdate;
+        }
+
+        let head = "";
+        let symbol = "";
+        let date = "";
+        if (dayNavMeta) {
+            head = String(dayNavMeta.head || "");
+            symbol = String(dayNavMeta.symbol || "");
+            date = String(dayNavMeta.date || "");
+        }
+
+        const hourInt = parseInt(hourValue, 10);
+        if (!head || !symbol || !/^\\d{8}$/.test(date) || Number.isNaN(hourInt) || hourInt < 0 || hourInt > 23) {
+            return noUpdate;
+        }
+
+        const hourIso = date.slice(0, 4) + "-" + date.slice(4, 6) + "-" + date.slice(6, 8) +
+            "T" + String(hourInt).padStart(2, "0") + ":00:00";
+        const nextParams = new URLSearchParams();
+        nextParams.set("head", head);
+        nextParams.set("symbol", symbol);
+        nextParams.set("date", date);
+        nextParams.set("hour", hourIso);
+        return "/chart?" + nextParams.toString();
+    }
+    """,
+    Output("url", "href", allow_duplicate=True),
     Input("day-hour-dropdown", "value", allow_optional=True),
-    Input("symbol-graph", "clickData", allow_optional=True),
-    State("url", "pathname"),
     State("day-nav-meta", "data", allow_optional=True),
-    State("hourly-nav-meta", "data", allow_optional=True),
-    State("url", "search"),
     prevent_initial_call=True,
 )
-def handle_navigation(
-    hour_value: str | None,
-    hourly_click_data: dict | None,
-    current_pathname: str | None,
-    day_nav_meta: dict | None,
-    hourly_nav_meta: dict | None,
-    current_search: str,
-):
-    if current_pathname == "/day" and hour_value and hour_value != "all":
-        head_raw = ""
-        symbol = ""
-        date = ""
-        if day_nav_meta:
-            head_raw = str(day_nav_meta.get("head", ""))
-            symbol = str(day_nav_meta.get("symbol", ""))
-            date = str(day_nav_meta.get("date", ""))
-        if (not head_raw or not symbol or len(date) != 8 or not date.isdigit()) and current_search:
-            query = parse_qs(current_search.lstrip("?"))
-            head_raw = unquote(query.get("head", [""])[0])
-            symbol = unquote(query.get("symbol", [""])[0])
-            date = query.get("date", [""])[0]
-        if not head_raw or not symbol or len(date) != 8 or not date.isdigit():
-            return no_update, no_update
-        try:
-            hour_int = int(hour_value)
-        except ValueError:
-            return no_update, no_update
-        if hour_int < 0 or hour_int > 23:
-            return no_update, no_update
-        hour_start = datetime.strptime(f"{date}{hour_int:02d}", "%Y%m%d%H")
-        next_search = (
-            f"?head={quote(head_raw)}"
-            f"&symbol={quote(symbol)}"
-            f"&date={date}"
-            f"&hour={quote(hour_start.isoformat())}"
-        )
-        return "/chart", next_search
 
-    if current_pathname == "/chart" and hourly_click_data:
-        points = hourly_click_data.get("points")
-        if not isinstance(points, list) or not points:
-            return no_update, no_update
-        point = points[0]
-        parent = point.get("customdata")
-        if parent is None:
-            return no_update, no_update
-        parent_order_id = str(parent).strip()
-        if not parent_order_id:
-            return no_update, no_update
-        head_raw = ""
-        symbol = ""
-        date = ""
-        if hourly_nav_meta:
-            head_raw = str(hourly_nav_meta.get("head", ""))
-            symbol = str(hourly_nav_meta.get("symbol", ""))
-            date = str(hourly_nav_meta.get("date", ""))
-        if (not head_raw or not symbol or len(date) != 8 or not date.isdigit()) and current_search:
-            query = parse_qs(current_search.lstrip("?"))
-            head_raw = unquote(query.get("head", [""])[0])
-            symbol = unquote(query.get("symbol", [""])[0])
-            date = query.get("date", [""])[0]
-        if not head_raw or not symbol or len(date) != 8 or not date.isdigit():
-            return no_update, no_update
-        clicked_time = parse_plotly_time(point.get("x"))
-        hour_param = ""
-        if clicked_time is not None:
-            hour_param = f"&hour={quote(clicked_time.floor('h').isoformat())}"
-        next_search = (
-            f"?head={quote(head_raw)}"
-            f"&symbol={quote(symbol)}"
-            f"&date={date}"
-            f"&parent_order_id={quote(parent_order_id)}"
-            f"{hour_param}"
-        )
-        return "/parent", next_search
 
-    return no_update, no_update
+app.clientside_callback(
+    """
+    function(clickData, pathname, hoverData, hourlyNavMeta) {
+        const noUpdate = window.dash_clientside.no_update;
+        if (pathname !== "/chart" || !clickData) {
+            return noUpdate;
+        }
+
+        function extractParent(payload) {
+            if (!payload || !Array.isArray(payload.points)) {
+                return null;
+            }
+            for (const point of payload.points) {
+                if (!point || point.customdata === undefined || point.customdata === null) {
+                    continue;
+                }
+                const candidate = String(point.customdata).trim();
+                if (candidate) {
+                    return candidate;
+                }
+            }
+            return null;
+        }
+
+        const parentOrderId = extractParent(clickData) || extractParent(hoverData);
+        if (!parentOrderId) {
+            return noUpdate;
+        }
+
+        let head = "";
+        let symbol = "";
+        let date = "";
+        if (hourlyNavMeta) {
+            head = String(hourlyNavMeta.head || "");
+            symbol = String(hourlyNavMeta.symbol || "");
+            date = String(hourlyNavMeta.date || "");
+        }
+
+        if (!head || !symbol || !/^\\d{8}$/.test(date)) {
+            return noUpdate;
+        }
+
+        const nextParams = new URLSearchParams();
+        nextParams.set("head", head);
+        nextParams.set("symbol", symbol);
+        nextParams.set("date", date);
+        nextParams.set("parent_order_id", parentOrderId);
+        return "/parent?" + nextParams.toString();
+    }
+    """,
+    Output("url", "href", allow_duplicate=True),
+    Input("symbol-graph", "clickData", allow_optional=True),
+    State("url", "pathname"),
+    State("symbol-graph", "hoverData", allow_optional=True),
+    State("hourly-nav-meta", "data", allow_optional=True),
+    prevent_initial_call=True,
+)
 
 
 @app.callback(
