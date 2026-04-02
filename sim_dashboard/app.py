@@ -597,43 +597,112 @@ def render_index() -> html.Div:
     return html.Div(sections, style={"maxWidth": "1200px", "margin": "0 auto", "padding": "16px"})
 
 
-def make_daily_figure(metrics_df: pd.DataFrame, symbol: str, head: Path, date: str) -> go.Figure:
+def make_daily_figure(metrics_df: pd.DataFrame, state_df: pd.DataFrame, symbol: str, head: Path, date: str) -> go.Figure:
     fig = make_subplots(
-        rows=4,
+        rows=3,
         cols=1,
         shared_xaxes=True,
-        vertical_spacing=0.04,
-        subplot_titles=("Position", "PnL", "Cumulative Notional Traded", "Cumulative Size Traded"),
+        vertical_spacing=0.06,
+        specs=[[{"secondary_y": True}], [{}], [{"secondary_y": True}]],
+        subplot_titles=("Position", "PnL", "Cumulative Notional / Size"),
     )
     series = (
-        ("position", "#1f77b4"),
-        ("pnl", "#2ca02c"),
-        ("cum_notional_traded", "#ff7f0e"),
-        ("cum_size_traded", "#17a2b8"),
+        (1, "position", "#0F766E", False, "Position"),
+        (2, "pnl", "#2563EB", False, "PnL"),
+        (3, "cum_notional_traded", "#C2410C", False, "Cum Notional"),
+        (3, "cum_size_traded", "#7C3AED", True, "Cum Size"),
     )
-    for row_idx, (col, color) in enumerate(series, start=1):
+    for row_idx, col, color, secondary_y, label in series:
         y = pd.to_numeric(metrics_df[col], errors="coerce")
         fig.add_trace(
             go.Scattergl(
                 x=metrics_df["time"],
                 y=y,
                 mode="lines",
-                name=col,
+                name=label,
                 line={"color": color, "width": 1.6},
                 showlegend=False,
-                hovertemplate=f"{col}=%{{y}}<extra></extra>",
+                hovertemplate=f"{label}=%{{y}}<extra></extra>",
             ),
             row=row_idx,
             col=1,
+            secondary_y=secondary_y,
         )
-        fig.update_yaxes(title=col, row=row_idx, col=1)
+    if not state_df.empty:
+        mid = ((pd.to_numeric(state_df["bid"], errors="coerce") + pd.to_numeric(state_df["ask"], errors="coerce")) / 2.0).dropna()
+        if not mid.empty:
+            fig.add_trace(
+                go.Scattergl(
+                    x=state_df.loc[mid.index, "time"],
+                    y=mid,
+                    mode="lines",
+                    name="Mid Price",
+                    line={"color": "#B45309", "width": 1.4},
+                    showlegend=False,
+                    hovertemplate="Mid Price=%{y}<extra></extra>",
+                ),
+                row=1,
+                col=1,
+                secondary_y=True,
+            )
+    fig.update_yaxes(
+        title={"text": "Position", "font": {"color": "#0F766E"}, "standoff": 2},
+        tickfont={"color": "#0F766E"},
+        row=1,
+        col=1,
+        secondary_y=False,
+        ticklabelstandoff=2,
+        automargin=True,
+    )
+    fig.update_yaxes(
+        title={"text": "PnL", "font": {"color": "#2563EB"}},
+        tickfont={"color": "#2563EB"},
+        row=2,
+        col=1,
+        secondary_y=False,
+        automargin=True,
+    )
+    fig.update_yaxes(
+        title={"text": "Cum Notional", "font": {"color": "#C2410C"}},
+        tickfont={"color": "#C2410C"},
+        row=3,
+        col=1,
+        secondary_y=False,
+        automargin=True,
+    )
+    fig.update_yaxes(
+        title={"text": "Mid Price", "font": {"color": "#B45309"}, "standoff": 4},
+        tickfont={"color": "#B45309"},
+        row=1,
+        col=1,
+        secondary_y=True,
+        ticklabelstandoff=4,
+        automargin=True,
+    )
+    fig.update_yaxes(
+        title={"text": "Cum Size", "font": {"color": "#7C3AED"}},
+        tickfont={"color": "#7C3AED"},
+        row=3,
+        col=1,
+        secondary_y=True,
+        automargin=True,
+    )
 
-    fig.update_xaxes(title="Time", row=4, col=1)
+    fig.update_xaxes(row=1, col=1, domain=[0.02, 1.0])
+    fig.update_xaxes(row=2, col=1, domain=[0.02, 1.0])
+    fig.update_xaxes(title="Time", row=3, col=1, domain=[0.02, 1.0])
+    fig.update_layout(
+        yaxis={"side": "left", "position": 0.02, "automargin": True},
+        yaxis2={"side": "right", "automargin": True},
+        yaxis3={"side": "left", "position": 0.02, "automargin": True},
+        yaxis4={"side": "right", "automargin": True},
+        yaxis5={"side": "left", "position": 0.02, "automargin": True},
+    )
     fig.update_layout(
         template="plotly_white",
         height=980,
         title=f"{symbol} | {date} | {head} | Daily Metrics",
-        margin={"l": 80, "r": 20, "t": 70, "b": 50},
+        margin={"l": 18, "r": 85, "t": 70, "b": 50},
         hovermode="x unified",
     )
     return fig
@@ -659,6 +728,7 @@ def render_day(search: str) -> html.Div:
     metrics_df = load_daily_metrics_frame(str(state_path), state_path.stat().st_mtime_ns)
     if metrics_df.empty:
         return html.Div([html.H3("State file has no usable rows"), html.Pre(str(state_path))])
+    state_df = load_state_frame(str(state_path), state_path.stat().st_mtime_ns)
 
     orders = []
     if order_path.exists():
@@ -670,7 +740,7 @@ def render_day(search: str) -> html.Div:
         if metrics_df[col].dropna().empty:
             missing.append(col)
 
-    fig = make_daily_figure(metrics_df, symbol, head, date)
+    fig = make_daily_figure(metrics_df, state_df, symbol, head, date)
     hour_options = [{"label": "all", "value": "all"}]
     hour_options.extend({"label": f"{h}h", "value": f"{h}"} for h in available_hours)
     return html.Div(
@@ -885,13 +955,13 @@ def make_figure(
         title="Time",
         range=[initial_start, initial_end],
         rangeslider={"visible": False},
-        domain=[0.09, 1.0],
+        domain=[0.05, 1.0],
         type="date",
     )
     fig.update_yaxes(
         title={"text": "Price", "standoff": 4},
         side="left",
-        position=0.09,
+        position=0.05,
         automargin=True,
         range=[y_min, y_max],
     )
@@ -907,7 +977,7 @@ def make_figure(
             "overlaying": "y",
             "matches": "y",
             "side": "left",
-            "position": 0.05,
+            "position": 0.02,
             "showgrid": False,
             "zeroline": False,
             "showticklabels": True,
@@ -920,11 +990,11 @@ def make_figure(
             "tickvals": bps_tickvals,
             "ticktext": bps_ticktext,
             "ticklabelposition": "outside",
-            "ticklabelstandoff": 6,
+            "ticklabelstandoff": 4,
             "automargin": True,
         },
         legend={"orientation": "h", "yanchor": "bottom", "y": 1.02, "xanchor": "left", "x": 0},
-        margin={"l": 72, "r": 20, "t": 80, "b": 50},
+        margin={"l": 42, "r": 20, "t": 80, "b": 50},
     )
     return fig
 
@@ -948,13 +1018,13 @@ def make_position_figure(
             hovertemplate="position=%{y}<extra></extra>",
         )
     )
-    fig.update_xaxes(title="Time", range=[initial_start, initial_end], rangeslider={"visible": False}, type="date", domain=[0.09, 1.0])
-    fig.update_yaxes(title={"text": "Position", "standoff": 4}, side="left", position=0.09, automargin=True)
+    fig.update_xaxes(title="Time", range=[initial_start, initial_end], rangeslider={"visible": False}, type="date", domain=[0.05, 1.0])
+    fig.update_yaxes(title={"text": "Position", "standoff": 4}, side="left", position=0.05, automargin=True)
     fig.update_layout(
         template="plotly_white",
-        height=190,
+        height=140,
         title="Position",
-        margin={"l": 72, "r": 20, "t": 60, "b": 40},
+        margin={"l": 42, "r": 20, "t": 60, "b": 40},
         hovermode="x unified",
     )
     return fig
@@ -1046,8 +1116,8 @@ def render_chart(search: str) -> html.Div:
                     "window_minutes": 60,
                 },
             ),
-            dcc.Graph(id="position-graph", figure=position_fig, style={"height": "28vh"}),
             dcc.Graph(id="symbol-graph", figure=fig, style={"height": "62vh"}),
+            dcc.Graph(id="position-graph", figure=position_fig, style={"height": "20vh"}),
         ]
     )
 
@@ -1162,8 +1232,8 @@ def render_parent(search: str) -> html.Div:
                     "window_minutes": max(1, int((window_end - window_start).total_seconds() / 60)),
                 },
             ),
-            dcc.Graph(id="position-graph", figure=position_fig, style={"height": "28vh"}),
             dcc.Graph(id="symbol-graph", figure=fig, style={"height": "62vh"}),
+            dcc.Graph(id="position-graph", figure=position_fig, style={"height": "20vh"}),
         ]
     )
 
