@@ -2,8 +2,8 @@
 
 Dash app to browse simulation heads and visualize:
 
-- `bid`/`ask` from `log/state/*.csv`
-- order price lines from `log/order.????????.log` grouped by `client_order_id`
+- `bid`/`ask` from `log/state/*.parquet`
+- order price lines from `log/order.????????.{parquet,log}` grouped by `client_order_id`
 
 ## Run
 

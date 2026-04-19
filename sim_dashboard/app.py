@@ -18,8 +18,9 @@ from dash import Input, Output, Patch, State, dcc, html, no_update
 
 ROOT_ORDER = ("dumpsim", "livesim", "tradesim")
 ROOTS = [Path.home() / "workspace" / "sgt" / name for name in ROOT_ORDER]
-ORDER_PATTERN = "order.????????.log"
 BPS_COLOR = "#C19A6B"
+ORDER_PQ_PATTERN = "order.????????.parquet"
+ORDER_LOG_PATTERN = "order.????????.log"
 
 BUY_COLORS = (
     "#003F5C",  # deep blue-teal
@@ -71,11 +72,11 @@ def normalize_head(head: str) -> Path | None:
 
 
 def parse_state_filename(path: Path) -> StateFile | None:
-    # Expected form: SYMBOL.0.YYYYMMDD.csv
+    # Expected form: SYMBOL.0.YYYYMMDD.parquet
     parts = path.name.split(".")
     if len(parts) < 4:
         return None
-    if parts[-1] != "csv":
+    if parts[-1] != "parquet":
         return None
     date = parts[-2]
     if len(date) != 8 or not date.isdigit():
@@ -97,7 +98,7 @@ def discover_heads() -> dict[str, list[Path]]:
             state_dir = log_dir / "state"
             if not state_dir.is_dir():
                 continue
-            if not any(log_dir.glob(ORDER_PATTERN)):
+            if not any(log_dir.glob(ORDER_PQ_PATTERN)) and not any(log_dir.glob(ORDER_LOG_PATTERN)):
                 continue
             grouped[root_name].append(log_dir.parent)
         grouped[root_name].sort()
@@ -109,12 +110,15 @@ def state_files_for_head(head: Path) -> list[StateFile]:
     if not state_dir.is_dir():
         return []
     rows: list[StateFile] = []
-    for csv_path in state_dir.glob("*.csv"):
-        parsed = parse_state_filename(csv_path)
+    for pq_path in state_dir.glob("*.parquet"):
+        parsed = parse_state_filename(pq_path)
         if parsed is None:
             continue
-        # Keep entries that can map to an order log date.
-        if not (head / "log" / f"order.{parsed.date}.log").exists():
+        # Keep entries that can map to an order file for the same date.
+        if not (
+            (head / "log" / f"order.{parsed.date}.parquet").exists()
+            or (head / "log" / f"order.{parsed.date}.log").exists()
+        ):
             continue
         rows.append(parsed)
     rows.sort(key=lambda x: (x.symbol, x.date))
@@ -282,19 +286,19 @@ def build_bps_ticks(price_min: float, price_max: float, base_price: float, count
 
 
 @lru_cache(maxsize=32)
-def load_state_frame(state_path_str: str, mtime_ns: int) -> pd.DataFrame:
+def load_state_table(state_path_str: str, mtime_ns: int) -> pd.DataFrame:
     del mtime_ns
-    state_path = Path(state_path_str)
-    columns = pd.read_csv(state_path, nrows=0).columns.tolist()
-    bid_col = "bid" if "bid" in columns else "bid_price"
-    ask_col = "ask" if "ask" in columns else "ask_price"
-    if bid_col not in columns or ask_col not in columns:
+    return pd.read_parquet(Path(state_path_str))
+
+
+@lru_cache(maxsize=32)
+def load_state_frame(state_path_str: str, mtime_ns: int) -> pd.DataFrame:
+    df = load_state_table(state_path_str, mtime_ns).copy()
+    bid_col = "bid" if "bid" in df.columns else "bid_price"
+    ask_col = "ask" if "ask" in df.columns else "ask_price"
+    if bid_col not in df.columns or ask_col not in df.columns:
         return pd.DataFrame(columns=["time", "bid", "ask"])
-    df = pd.read_csv(
-        state_path,
-        usecols=["time", bid_col, ask_col],
-    )
-    df = df.rename(columns={bid_col: "bid", ask_col: "ask"})
+    df = df[["time", bid_col, ask_col]].rename(columns={bid_col: "bid", ask_col: "ask"})
     df["time"] = pd.to_datetime(df["time"], unit="us", errors="coerce")
     for col in ("bid", "ask"):
         df[col] = pd.to_numeric(df[col], errors="coerce")
@@ -306,14 +310,11 @@ def load_state_frame(state_path_str: str, mtime_ns: int) -> pd.DataFrame:
 
 @lru_cache(maxsize=32)
 def load_position_frame(state_path_str: str, mtime_ns: int) -> pd.DataFrame:
-    del mtime_ns
-    state_path = Path(state_path_str)
-    columns = pd.read_csv(state_path, nrows=0).columns.tolist()
-    pos_col = "position" if "position" in columns else ("pos" if "pos" in columns else None)
+    df = load_state_table(state_path_str, mtime_ns).copy()
+    pos_col = "position" if "position" in df.columns else ("pos" if "pos" in df.columns else None)
     if pos_col is None:
         return pd.DataFrame(columns=["time", "position"])
-    df = pd.read_csv(state_path, usecols=["time", pos_col])
-    df = df.rename(columns={pos_col: "position"})
+    df = df[["time", pos_col]].rename(columns={pos_col: "position"})
     df["time"] = pd.to_datetime(df["time"], unit="us", errors="coerce")
     df["position"] = pd.to_numeric(df["position"], errors="coerce")
     df = df.dropna(subset=["time"]).sort_values("time")
@@ -322,9 +323,8 @@ def load_position_frame(state_path_str: str, mtime_ns: int) -> pd.DataFrame:
 
 @lru_cache(maxsize=32)
 def load_daily_metrics_frame(state_path_str: str, mtime_ns: int) -> pd.DataFrame:
-    del mtime_ns
-    state_path = Path(state_path_str)
-    columns = pd.read_csv(state_path, nrows=0).columns.tolist()
+    df = load_state_table(state_path_str, mtime_ns).copy()
+    columns = df.columns.tolist()
 
     def pick_first(*candidates: str) -> str | None:
         for candidate in candidates:
@@ -354,7 +354,7 @@ def load_daily_metrics_frame(state_path_str: str, mtime_ns: int) -> pd.DataFrame
     if len(usecols) == 1:
         return pd.DataFrame(columns=["time", "position", "pnl", "cum_notional_traded", "cum_size_traded"])
 
-    df = pd.read_csv(state_path, usecols=usecols)
+    df = df[usecols]
     rename_map = {}
     if position_col:
         rename_map[position_col] = "position"
@@ -388,10 +388,396 @@ def load_daily_metrics_frame(state_path_str: str, mtime_ns: int) -> pd.DataFrame
     return df
 
 
+def _load_order_parquet(order_path: Path, symbol: str, mtime_ns: int) -> pd.DataFrame:
+    df = load_order_table(str(order_path), mtime_ns).copy()
+    if "symbol" in df.columns:
+        df = df[df["symbol"] == symbol]
+    return df
+
+
+@lru_cache(maxsize=32)
+def load_order_table(order_path_str: str, mtime_ns: int) -> pd.DataFrame:
+    del mtime_ns
+    return pd.read_parquet(Path(order_path_str))
+
+
+def _orders_from_parquet(order_path: Path, symbol: str, mtime_ns: int) -> list[dict]:
+    df = _load_order_parquet(order_path, symbol, mtime_ns)
+    rows: list[dict] = []
+    for row in df.itertuples(index=False):
+        try:
+            side = _normalize_side(getattr(row, "side", None))
+            price = getattr(row, "price", None)
+            qty = getattr(row, "qty", None)
+            client_order_id = getattr(row, "client_order_id", None)
+            parent_order_id = getattr(row, "parent_order_id", None)
+            start_ts_us = getattr(row, "create_time", None)
+            end_ts_us = getattr(row, "last_update_time", None)
+        except AttributeError:
+            continue
+        if client_order_id is None or side is None or price is None or start_ts_us is None or end_ts_us is None:
+            continue
+        try:
+            start_ts_us_i = int(start_ts_us)
+            end_ts_us_i = int(end_ts_us)
+            price_f = float(price)
+        except (TypeError, ValueError):
+            continue
+        if end_ts_us_i <= start_ts_us_i:
+            end_ts_us_i = start_ts_us_i + 1
+        rows.append(
+            {
+                "parent_order_id": None if parent_order_id is None else str(parent_order_id),
+                "client_order_id": str(client_order_id),
+                "side": side,
+                "price": price_f,
+                "size": None if qty is None else float(qty),
+                "start_ts_us": start_ts_us_i,
+                "end_ts_us": end_ts_us_i,
+            }
+        )
+    rows.sort(key=lambda x: x["start_ts_us"])
+    return rows
+
+
+def _fills_from_parquet(order_path: Path, symbol: str, mtime_ns: int) -> list[dict]:
+    df = _load_order_parquet(order_path, symbol, mtime_ns)
+    if df.empty:
+        return []
+    rows: list[dict] = []
+    if "filled_qty" not in df.columns:
+        return []
+    fill_df = df[pd.to_numeric(df["filled_qty"], errors="coerce").fillna(0) > 0].copy()
+    for row in fill_df.itertuples(index=False):
+        side = _normalize_side(getattr(row, "side", None))
+        if side is None:
+            continue
+        ts_us = getattr(row, "last_update_time", None)
+        if ts_us is None:
+            ts_us = getattr(row, "acked_time", None)
+        if ts_us is None:
+            ts_us = getattr(row, "create_time", None)
+        price = getattr(row, "avg_fill_price", None)
+        if price in (None, 0, 0.0):
+            price = getattr(row, "price", None)
+        filled_qty = getattr(row, "filled_qty", None)
+        if ts_us is None or price in (None, 0, 0.0) or filled_qty is None:
+            continue
+        try:
+            rows.append(
+                {
+                    "ts_us": int(ts_us),
+                    "side": side,
+                    "price": float(price),
+                    "parent_order_id": None if getattr(row, "parent_order_id", None) is None else str(getattr(row, "parent_order_id")),
+                    "client_order_id": str(getattr(row, "client_order_id", "")),
+                    "filled_qty": float(filled_qty),
+                }
+            )
+        except (TypeError, ValueError):
+            continue
+    rows.sort(key=lambda x: x["ts_us"])
+    return rows
+
+
+def _aggregate_parent_orders(orders: list[dict]) -> list[dict]:
+    grouped: dict[tuple[str, str], dict] = {}
+    for order in orders:
+        parent_order_id = str(order.get("parent_order_id") or order.get("client_order_id") or "")
+        side = order.get("side")
+        if not parent_order_id or side not in ("BUY", "SELL"):
+            continue
+        key = (parent_order_id, side)
+        item = grouped.get(key)
+        start_ts_us = int(order["start_ts_us"])
+        end_ts_us = int(order["end_ts_us"])
+        price = float(order["price"])
+        if item is None:
+            grouped[key] = {
+                "parent_order_id": parent_order_id,
+                "side": side,
+                "events": [(start_ts_us, 1, price), (end_ts_us, -1, price)],
+                "start_ts_us": start_ts_us,
+                "end_ts_us": end_ts_us,
+                "order_count": 1,
+                "child_order_ids": [str(order["client_order_id"])],
+                "child_sizes": [order.get("size")],
+            }
+            continue
+
+        item["start_ts_us"] = min(item["start_ts_us"], start_ts_us)
+        item["end_ts_us"] = max(item["end_ts_us"], end_ts_us)
+        item["order_count"] += 1
+        item["child_order_ids"].append(str(order["client_order_id"]))
+        item["child_sizes"].append(order.get("size"))
+        item["events"].append((start_ts_us, 1, price))
+        item["events"].append((end_ts_us, -1, price))
+
+    rows: list[dict] = []
+    for item in grouped.values():
+        events = sorted(item["events"], key=lambda x: (x[0], x[1]))
+        price_counts: dict[float, int] = {}
+        price_points: list[tuple[int, float]] = []
+        i = 0
+        while i < len(events):
+            ts_us = events[i][0]
+            while i < len(events) and events[i][0] == ts_us and events[i][1] < 0:
+                _, _, price = events[i]
+                price_counts[price] = price_counts.get(price, 0) - 1
+                if price_counts[price] <= 0:
+                    price_counts.pop(price, None)
+                i += 1
+            while i < len(events) and events[i][0] == ts_us and events[i][1] > 0:
+                _, _, price = events[i]
+                price_counts[price] = price_counts.get(price, 0) + 1
+                i += 1
+            if price_counts:
+                current = max(price_counts) if item["side"] == "BUY" else min(price_counts)
+                price_points.append((ts_us, current))
+        deduped: list[tuple[int, float]] = []
+        for ts_us, price in price_points:
+            if deduped and deduped[-1][1] == price:
+                continue
+            deduped.append((ts_us, price))
+        rows.append(
+            {
+                "parent_order_id": item["parent_order_id"],
+                "side": item["side"],
+                "start_ts_us": item["start_ts_us"],
+                "end_ts_us": item["end_ts_us"],
+                "price_points": deduped,
+                "order_count": item["order_count"],
+                "child_order_ids": item["child_order_ids"],
+                "child_sizes": item["child_sizes"],
+            }
+        )
+
+    rows.sort(key=lambda x: (x["parent_order_id"], x["side"]))
+    return rows
+
+
+def _aggregate_parent_fills(fills: list[dict]) -> list[dict]:
+    grouped: dict[tuple[str, str], dict] = {}
+    for fill in fills:
+        parent_order_id = str(fill.get("parent_order_id") or fill.get("client_order_id") or "")
+        side = fill.get("side")
+        if not parent_order_id or side not in ("BUY", "SELL"):
+            continue
+        key = (parent_order_id, side)
+        item = grouped.get(key)
+        ts_us = int(fill["ts_us"])
+        price = float(fill["price"])
+        qty = float(fill["filled_qty"])
+        if item is None:
+            grouped[key] = {
+                "parent_order_id": parent_order_id,
+                "side": side,
+                "last_ts_us": ts_us,
+                "last_price": price,
+                "last_qty": qty,
+                "fill_count": 1,
+                "total_qty": qty,
+                "prices": [price],
+            }
+            continue
+
+        item["fill_count"] += 1
+        item["total_qty"] += qty
+        item["prices"].append(price)
+        if ts_us >= item["last_ts_us"]:
+            item["last_ts_us"] = ts_us
+            item["last_price"] = price
+            item["last_qty"] = qty
+
+    rows: list[dict] = []
+    for item in grouped.values():
+        rows.append(item)
+    rows.sort(key=lambda x: (x["parent_order_id"], x["side"]))
+    return rows
+
+
+def _child_order_traces(
+    orders: list[dict],
+    *,
+    show_child_ids: bool = True,
+    line_width: float = 3.4,
+) -> list[go.Scatter]:
+    traces: list[go.Scatter] = []
+    parent_color_map: dict[tuple[str, str], str] = {}
+    buy_palette_i = 0
+    sell_palette_i = 0
+    for order in orders:
+        side = order["side"]
+        parent_order_id = str(order.get("parent_order_id") or order["client_order_id"])
+        color = parent_color_map.get((parent_order_id, side))
+        if color is None:
+            if side == "BUY":
+                color = BUY_COLORS[buy_palette_i % len(BUY_COLORS)]
+                buy_palette_i += 1
+            else:
+                color = SELL_COLORS[sell_palette_i % len(SELL_COLORS)]
+                sell_palette_i += 1
+            parent_color_map[(parent_order_id, side)] = color
+
+        x0 = pd.to_datetime(order["start_ts_us"], unit="us")
+        x1 = pd.to_datetime(order["end_ts_us"], unit="us")
+        y = order["price"]
+        if x1 <= x0:
+            order_x = [x0, x1]
+        else:
+            duration_seconds = max((x1 - x0).total_seconds(), 0.0)
+            sample_count = max(25, min(200, int(duration_seconds) + 2))
+            step = (x1 - x0) / (sample_count - 1)
+            order_x = [x0 + step * i for i in range(sample_count)]
+        order_y = [y] * len(order_x)
+        hover_parts = [
+            f"parent_order_id={order.get('parent_order_id', '')}",
+            f"client_order_id={order['client_order_id']}",
+            f"side={side}",
+            f"size={'' if order.get('size') is None else order.get('size')}",
+            f"price={y}",
+        ]
+        if show_child_ids:
+            hover_parts.insert(2, f"child_order_id={order['client_order_id']}")
+        order_hover = "<br>".join(hover_parts) + "<extra></extra>"
+        traces.append(
+            go.Scatter(
+                x=[x0, x1] if x1 > x0 else order_x,
+                y=[y, y] if x1 > x0 else order_y,
+                mode="lines",
+                name=f"{side} {order['client_order_id']}",
+                showlegend=False,
+                line={"color": color, "width": line_width},
+                customdata=[str(order.get("parent_order_id") or "")] * (2 if x1 > x0 else len(order_x)),
+                hovertemplate=order_hover,
+            )
+        )
+        traces.append(
+            go.Scatter(
+                x=order_x,
+                y=order_y,
+                mode="markers",
+                showlegend=False,
+                marker={"size": 18, "color": color, "opacity": 0.001},
+                customdata=[str(order.get("parent_order_id") or "")] * len(order_x),
+                hovertemplate=order_hover,
+            )
+        )
+    return traces
+
+
+def _aggregated_order_traces(orders: list[dict], *, line_width: float = 2.2) -> list[go.Scatter]:
+    traces: list[go.Scatter] = []
+    aggregated_orders = _aggregate_parent_orders(orders)
+    parent_color_map: dict[tuple[str, str], str] = {}
+    buy_palette_i = 0
+    sell_palette_i = 0
+    for order in aggregated_orders:
+        parent_order_id = str(order["parent_order_id"])
+        side = order["side"]
+        color = parent_color_map.get((parent_order_id, side))
+        if color is None:
+            if side == "BUY":
+                color = BUY_COLORS[buy_palette_i % len(BUY_COLORS)]
+                buy_palette_i += 1
+            else:
+                color = SELL_COLORS[sell_palette_i % len(SELL_COLORS)]
+                sell_palette_i += 1
+            parent_color_map[(parent_order_id, side)] = color
+
+        x0 = pd.to_datetime(order["start_ts_us"], unit="us")
+        x1 = pd.to_datetime(order["end_ts_us"], unit="us")
+        points = order["price_points"]
+        if len(points) == 1:
+            points = [(order["start_ts_us"], points[0][1]), (order["end_ts_us"], points[0][1])]
+        order_x = [pd.to_datetime(ts_us, unit="us") for ts_us, _ in points]
+        order_y = [price for _, price in points]
+        if x1 <= x0:
+            order_x = [x0, x1]
+            order_y = [order_y[0], order_y[0]]
+        order_hover = (
+            f"parent_order_id={parent_order_id}<br>"
+            f"side={side}<br>"
+            f"order_count={order['order_count']}<br>"
+            f"price={order_y[-1]}<extra></extra>"
+        )
+        traces.append(
+            go.Scatter(
+                x=order_x,
+                y=order_y,
+                mode="lines",
+                name=f"{side} {parent_order_id}",
+                showlegend=False,
+                line={"color": color, "width": line_width},
+                line_shape="hv",
+                customdata=[parent_order_id] * len(order_x),
+                hovertemplate=order_hover,
+            )
+        )
+    return traces
+
+
+def _child_fill_traces(fills: list[dict]) -> tuple[list, list, list]:
+    buy_fill_x: list = []
+    buy_fill_y: list = []
+    buy_fill_text: list = []
+    sell_fill_x: list = []
+    sell_fill_y: list = []
+    sell_fill_text: list = []
+    for fill in fills:
+        x = pd.to_datetime(fill["ts_us"], unit="us")
+        text = (
+            f"parent_order_id={fill.get('parent_order_id', '')}<br>"
+            f"client_order_id={fill['client_order_id']}<br>"
+            f"price={fill['price']}<br>"
+            f"filled_qty={fill['filled_qty']}"
+        )
+        if fill["side"] == "BUY":
+            buy_fill_x.append(x)
+            buy_fill_y.append(fill["price"])
+            buy_fill_text.append(text)
+        else:
+            sell_fill_x.append(x)
+            sell_fill_y.append(fill["price"])
+            sell_fill_text.append(text)
+    return (buy_fill_x, buy_fill_y, buy_fill_text), (sell_fill_x, sell_fill_y, sell_fill_text)
+
+
+def _aggregated_fill_traces(fills: list[dict]) -> tuple[list, list, list]:
+    buy_fill_x: list = []
+    buy_fill_y: list = []
+    buy_fill_text: list = []
+    sell_fill_x: list = []
+    sell_fill_y: list = []
+    sell_fill_text: list = []
+    aggregated_fills = _aggregate_parent_fills(fills)
+    for fill in aggregated_fills:
+        x = pd.to_datetime(fill["last_ts_us"], unit="us")
+        text = (
+            f"parent_order_id={fill.get('parent_order_id', '')}<br>"
+            f"side={fill['side']}<br>"
+            f"fill_count={fill['fill_count']}<br>"
+            f"total_qty={fill['total_qty']}<br>"
+            f"last_price={fill['last_price']}<br>"
+            f"last_qty={fill['last_qty']}"
+        )
+        if fill["side"] == "BUY":
+            buy_fill_x.append(x)
+            buy_fill_y.append(fill["last_price"])
+            buy_fill_text.append(text)
+        else:
+            sell_fill_x.append(x)
+            sell_fill_y.append(fill["last_price"])
+            sell_fill_text.append(text)
+    return (buy_fill_x, buy_fill_y, buy_fill_text), (sell_fill_x, sell_fill_y, sell_fill_text)
+
+
 @lru_cache(maxsize=32)
 def load_orders(order_log_path_str: str, symbol: str, mtime_ns: int) -> list[dict]:
-    del mtime_ns
     order_log_path = Path(order_log_path_str)
+    if order_log_path.suffix == ".parquet":
+        return _orders_from_parquet(order_log_path, symbol, mtime_ns)
+    del mtime_ns
     grouped: dict[str, dict] = {}
     with order_log_path.open("r", encoding="utf-8", errors="replace") as f:
         for line in f:
@@ -468,8 +854,10 @@ def load_orders(order_log_path_str: str, symbol: str, mtime_ns: int) -> list[dic
 
 @lru_cache(maxsize=32)
 def load_fills(order_log_path_str: str, symbol: str, mtime_ns: int) -> list[dict]:
-    del mtime_ns
     order_log_path = Path(order_log_path_str)
+    if order_log_path.suffix == ".parquet":
+        return _fills_from_parquet(order_log_path, symbol, mtime_ns)
+    del mtime_ns
     rows: list[dict] = []
     with order_log_path.open("r", encoding="utf-8", errors="replace") as f:
         for line in f:
@@ -720,8 +1108,10 @@ def render_day(search: str) -> html.Div:
     if not symbol or len(date) != 8 or not date.isdigit():
         return html.Div([html.H3("Missing symbol/date"), html.Pre(search)])
 
-    state_path = head / "log" / "state" / f"{symbol}.0.{date}.csv"
-    order_path = head / "log" / f"order.{date}.log"
+    state_path = head / "log" / "state" / f"{symbol}.0.{date}.parquet"
+    order_path = head / "log" / f"order.{date}.parquet"
+    if not order_path.exists():
+        order_path = head / "log" / f"order.{date}.log"
     if not state_path.exists():
         return html.Div([html.H3("State file not found"), html.Pre(str(state_path))])
 
@@ -780,6 +1170,8 @@ def make_figure(
     initial_start: pd.Timestamp,
     initial_end: pd.Timestamp,
     show_book: bool = True,
+    detailed_orders: bool = False,
+    detailed_fills: bool = False,
 ) -> go.Figure:
     fig = go.Figure()
     if show_book:
@@ -804,89 +1196,25 @@ def make_figure(
             )
         )
 
-    parent_color_map: dict[str, str] = {}
-    buy_palette_i = 0
-    sell_palette_i = 0
-    for order in orders:
-        side = order["side"]
-        parent_order_id = str(order.get("parent_order_id") or order["client_order_id"])
-        color = parent_color_map.get(parent_order_id)
-        if color is None:
-            if side == "BUY":
-                color = BUY_COLORS[buy_palette_i % len(BUY_COLORS)]
-                buy_palette_i += 1
-            else:
-                color = SELL_COLORS[sell_palette_i % len(SELL_COLORS)]
-                sell_palette_i += 1
-            parent_color_map[parent_order_id] = color
+    if detailed_orders:
+        order_traces = _child_order_traces(orders, show_child_ids=True, line_width=3.4)
+    else:
+        order_traces = _aggregated_order_traces(orders, line_width=2.0)
 
-        x0 = pd.to_datetime(order["start_ts_us"], unit="us")
-        x1 = pd.to_datetime(order["end_ts_us"], unit="us")
-        y = order["price"]
-        if x1 <= x0:
-            order_x = [x0]
-        else:
-            # Dense sampling makes the full order span easy to click without needing a second click.
-            duration_seconds = max((x1 - x0).total_seconds(), 0.0)
-            sample_count = max(25, min(200, int(duration_seconds) + 2))
-            step = (x1 - x0) / (sample_count - 1)
-            order_x = [x0 + step * i for i in range(sample_count)]
-        order_hover = (
-            f"parent_order_id={order.get('parent_order_id', '')}<br>"
-            f"client_order_id={order['client_order_id']}<br>"
-            f"side={side}<br>"
-            f"size={'' if order.get('size') is None else order.get('size')}<br>"
-            f"price={y}<extra></extra>"
-        )
-        fig.add_trace(
-            go.Scatter(
-                x=[x0, x1],
-                y=[y, y],
-                mode="lines",
-                name=f"{side} {order['client_order_id']}",
-                showlegend=False,
-                line={"color": color, "width": 3.4},
-                customdata=[str(order.get("parent_order_id") or ""), str(order.get("parent_order_id") or "")],
-                hovertemplate=order_hover,
-            )
-        )
-        fig.add_trace(
-            go.Scatter(
-                x=order_x,
-                y=[y] * len(order_x),
-                mode="markers",
-                showlegend=False,
-                marker={"size": 18, "color": color, "opacity": 0.001},
-                customdata=[str(order.get("parent_order_id") or "")] * len(order_x),
-                hovertemplate=order_hover,
-            )
-        )
+    if detailed_fills:
+        (buy_fill_x, buy_fill_y, buy_fill_text), (sell_fill_x, sell_fill_y, sell_fill_text) = _child_fill_traces(fills)
+        buy_fill_parent = [str(fill.get("parent_order_id") or "") for fill in fills if fill["side"] == "BUY"]
+        sell_fill_parent = [str(fill.get("parent_order_id") or "") for fill in fills if fill["side"] == "SELL"]
+    else:
+        aggregated_fills = _aggregate_parent_fills(fills)
+        (buy_fill_x, buy_fill_y, buy_fill_text), (sell_fill_x, sell_fill_y, sell_fill_text) = _aggregated_fill_traces(fills)
+        buy_fill_parent = [str(fill.get("parent_order_id") or "") for fill in aggregated_fills if fill["side"] == "BUY"]
+        sell_fill_parent = [str(fill.get("parent_order_id") or "") for fill in aggregated_fills if fill["side"] == "SELL"]
 
-    buy_fill_x: list = []
-    buy_fill_y: list = []
-    buy_fill_text: list = []
-    sell_fill_x: list = []
-    sell_fill_y: list = []
-    sell_fill_text: list = []
-    for fill in fills:
-        x = pd.to_datetime(fill["ts_us"], unit="us")
-        text = (
-            f"parent_order_id={fill.get('parent_order_id', '')}<br>"
-            f"client_order_id={fill['client_order_id']}<br>"
-            f"price={fill['price']}<br>"
-            f"filled_qty={fill['filled_qty']}"
-        )
-        if fill["side"] == "BUY":
-            buy_fill_x.append(x)
-            buy_fill_y.append(fill["price"])
-            buy_fill_text.append(text)
-        else:
-            sell_fill_x.append(x)
-            sell_fill_y.append(fill["price"])
-            sell_fill_text.append(text)
+    for trace in order_traces:
+        fig.add_trace(trace)
 
     if buy_fill_x:
-        buy_fill_parent = [str(fill.get("parent_order_id") or "") for fill in fills if fill["side"] == "BUY"]
         fig.add_trace(
             go.Scatter(
                 x=buy_fill_x,
@@ -901,7 +1229,6 @@ def make_figure(
             )
         )
     if sell_fill_x:
-        sell_fill_parent = [str(fill.get("parent_order_id") or "") for fill in fills if fill["side"] == "SELL"]
         fig.add_trace(
             go.Scatter(
                 x=sell_fill_x,
@@ -1043,8 +1370,10 @@ def render_chart(search: str) -> html.Div:
     if not symbol or len(date) != 8 or not date.isdigit():
         return html.Div([html.H3("Missing symbol/date"), html.Pre(search)])
 
-    state_path = head / "log" / "state" / f"{symbol}.0.{date}.csv"
-    order_path = head / "log" / f"order.{date}.log"
+    state_path = head / "log" / "state" / f"{symbol}.0.{date}.parquet"
+    order_path = head / "log" / f"order.{date}.parquet"
+    if not order_path.exists():
+        order_path = head / "log" / f"order.{date}.log"
     if not state_path.exists():
         return html.Div([html.H3("State file not found"), html.Pre(str(state_path))])
     if not order_path.exists():
@@ -1080,7 +1409,20 @@ def render_chart(search: str) -> html.Div:
     if window_end <= window_start:
         window_end = window_start + timedelta(hours=1)
 
-    fig = make_figure(state_df, orders, fills, base_mid_price, symbol, head, date, window_start, window_end, show_book=True)
+    fig = make_figure(
+        state_df,
+        orders,
+        fills,
+        base_mid_price,
+        symbol,
+        head,
+        date,
+        window_start,
+        window_end,
+        show_book=True,
+        detailed_orders=False,
+        detailed_fills=False,
+    )
     position_fig = make_position_figure(position_df, symbol, head, date, window_start, window_end)
     initial_interval_text = format_interval_label(window_start, window_end)
     return html.Div(
@@ -1137,8 +1479,10 @@ def render_parent(search: str) -> html.Div:
     if not parent_order_id:
         return html.Div([html.H3("Missing parent_order_id"), html.Pre(search)])
 
-    state_path = head / "log" / "state" / f"{symbol}.0.{date}.csv"
-    order_path = head / "log" / f"order.{date}.log"
+    state_path = head / "log" / "state" / f"{symbol}.0.{date}.parquet"
+    order_path = head / "log" / f"order.{date}.parquet"
+    if not order_path.exists():
+        order_path = head / "log" / f"order.{date}.log"
     if not state_path.exists():
         return html.Div([html.H3("State file not found"), html.Pre(str(state_path))])
     if not order_path.exists():
@@ -1191,6 +1535,8 @@ def render_parent(search: str) -> html.Div:
         window_start,
         window_end,
         show_book=True,
+        detailed_orders=True,
+        detailed_fills=True,
     )
     position_fig = make_position_figure(position_df, symbol, head, date, window_start, window_end)
     initial_interval_text = format_interval_label(window_start, window_end)
