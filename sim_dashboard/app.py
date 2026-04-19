@@ -197,15 +197,21 @@ def format_interval_label(start: pd.Timestamp, end: pd.Timestamp) -> str:
     return f"{start_min.strftime('%H:%M')} - {end_min.strftime('%H:%M')}"
 
 
-def _minute_last_frame(df: pd.DataFrame) -> pd.DataFrame:
+def _bucket_last_frame(df: pd.DataFrame, bucket_minutes: int) -> pd.DataFrame:
     if df.empty or "time" not in df.columns:
         return df
+    if bucket_minutes <= 1:
+        bucket_minutes = 1
     minute_df = df.copy()
     minute_df["time"] = pd.to_datetime(minute_df["time"], errors="coerce")
     minute_df = minute_df.dropna(subset=["time"]).sort_values("time")
-    minute_df["time"] = minute_df["time"].dt.floor("min")
+    minute_df["time"] = minute_df["time"].dt.floor(f"{bucket_minutes}min")
     minute_df = minute_df.groupby("time", as_index=False).last()
     return minute_df
+
+
+def _minute_last_frame(df: pd.DataFrame) -> pd.DataFrame:
+    return _bucket_last_frame(df, 1)
 
 
 def _slice_window(df: pd.DataFrame, start: pd.Timestamp, end: pd.Timestamp) -> pd.DataFrame:
@@ -215,6 +221,275 @@ def _slice_window(df: pd.DataFrame, start: pd.Timestamp, end: pd.Timestamp) -> p
     sliced["time"] = pd.to_datetime(sliced["time"], errors="coerce")
     sliced = sliced.dropna(subset=["time"])
     return sliced[(sliced["time"] >= start) & (sliced["time"] <= end)]
+
+
+def _last_row_frame(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty or "time" not in df.columns:
+        return df
+    last = df.copy()
+    last["time"] = pd.to_datetime(last["time"], errors="coerce")
+    last = last.dropna(subset=["time"]).sort_values("time")
+    if last.empty:
+        return last
+    return last.tail(1)
+
+
+def _power_of_ten_capital(max_abs_position_usd: float) -> float:
+    target = 10.0 * max(0.0, float(max_abs_position_usd))
+    capital = 10.0
+    while capital <= target:
+        capital *= 10.0
+    return capital
+
+
+def _format_usd(value: float | int | None) -> str:
+    if value is None or pd.isna(value):
+        return "-"
+    return f"${float(value):,.2f}"
+
+
+def _format_num(value: float | int | None, digits: int = 2) -> str:
+    if value is None or pd.isna(value):
+        return "-"
+    return f"{float(value):,.{digits}f}"
+
+
+def _format_pct(value: float | int | None, digits: int = 2) -> str:
+    if value is None or pd.isna(value):
+        return "-"
+    return f"{float(value) * 100.0:.{digits}f}%"
+
+
+def _format_ratio(value: float | int | None, digits: int = 2) -> str:
+    if value is None or pd.isna(value):
+        return "-"
+    value_f = float(value)
+    if not math.isfinite(value_f):
+        return "inf"
+    return f"{value_f:.{digits}f}"
+
+
+def _build_report_frame(metrics_df: pd.DataFrame, state_df: pd.DataFrame, bucket_minutes: int) -> pd.DataFrame:
+    metrics_df = _bucket_last_frame(metrics_df, bucket_minutes)
+    state_df = _bucket_last_frame(state_df, bucket_minutes)
+    if metrics_df.empty or state_df.empty:
+        return pd.DataFrame()
+
+    metrics_cols = [col for col in ("time", "position", "pnl", "cum_notional_traded", "cum_size_traded") if col in metrics_df.columns]
+    state_cols = [col for col in ("time", "bid", "ask") if col in state_df.columns]
+    if len(metrics_cols) < 2 or len(state_cols) < 3:
+        return pd.DataFrame()
+
+    merged = pd.merge(
+        metrics_df[metrics_cols],
+        state_df[state_cols],
+        on="time",
+        how="inner",
+    )
+    if merged.empty:
+        return merged
+
+    merged["time"] = pd.to_datetime(merged["time"], errors="coerce")
+    merged = merged.dropna(subset=["time"]).sort_values("time")
+    merged["position"] = pd.to_numeric(merged.get("position"), errors="coerce")
+    merged["pnl"] = pd.to_numeric(merged.get("pnl"), errors="coerce")
+    merged["cum_notional_traded"] = pd.to_numeric(merged.get("cum_notional_traded"), errors="coerce")
+    merged["cum_size_traded"] = pd.to_numeric(merged.get("cum_size_traded"), errors="coerce")
+    merged["mid"] = (pd.to_numeric(merged["bid"], errors="coerce") + pd.to_numeric(merged["ask"], errors="coerce")) / 2.0
+    merged["position_usd"] = merged["position"].abs() * merged["mid"]
+    return merged.dropna(subset=["mid"])
+
+
+def _return_series_stats(returns: pd.Series) -> dict[str, float]:
+    clean = pd.to_numeric(returns, errors="coerce").replace([float("inf"), float("-inf")], pd.NA).dropna()
+    if clean.empty:
+        return {
+            "volatility": 0.0,
+            "sharpe": 0.0,
+            "sortino": 0.0,
+            "profit_factor": 0.0,
+            "win_rate": 0.0,
+        }
+    mean = float(clean.mean())
+    std = float(clean.std(ddof=0))
+    downside = clean[clean < 0]
+    downside_std = float(downside.std(ddof=0)) if not downside.empty else 0.0
+    positive_sum = float(clean[clean > 0].sum())
+    negative_sum = float(clean[clean < 0].sum())
+    return {
+        "volatility": std,
+        "sharpe": mean / std if std else 0.0,
+        "sortino": mean / downside_std if downside_std else 0.0,
+        "profit_factor": positive_sum / abs(negative_sum) if negative_sum < 0 else (float("inf") if positive_sum > 0 else 0.0),
+        "win_rate": float((clean > 0).mean()),
+    }
+
+
+def _report_stats(report_df: pd.DataFrame, capital: float) -> dict[str, float]:
+    if report_df.empty:
+        return {
+            "capital": capital,
+            "total_pnl": 0.0,
+            "total_return": 0.0,
+            "max_drawdown": 0.0,
+            "max_abs_position_usd": 0.0,
+            "max_abs_position": 0.0,
+        }
+
+    pnl = pd.to_numeric(report_df["pnl"], errors="coerce").fillna(0.0)
+    equity = capital + pnl
+    peak = equity.cummax()
+    drawdown = equity / peak - 1.0
+    position = pd.to_numeric(report_df["position"], errors="coerce").fillna(0.0)
+    position_usd = pd.to_numeric(report_df["position_usd"], errors="coerce").fillna(0.0)
+
+    return {
+        "capital": capital,
+        "total_pnl": float(pnl.iloc[-1]),
+        "total_return": float(pnl.iloc[-1] / capital) if capital else 0.0,
+        "max_drawdown": float(drawdown.min()) if not drawdown.empty else 0.0,
+        "max_abs_position_usd": float(position_usd.abs().max()) if not position_usd.empty else 0.0,
+        "max_abs_position": float(position.abs().max()) if not position.empty else 0.0,
+    }
+
+
+def _make_stats_table(title: str, rows: list[tuple[str, str]], width: str = "min(520px, 100%)") -> html.Div:
+    return html.Div(
+        [
+            html.H4(title, style={"margin": "0 0 8px 0"}),
+            html.Table(
+                [
+                    html.Tbody(
+                        [
+                            html.Tr(
+                                [
+                                    html.Th(key, style={"textAlign": "left", "padding": "6px 10px", "borderBottom": "1px solid #ddd"}),
+                                    html.Td(value, style={"textAlign": "right", "padding": "6px 10px", "borderBottom": "1px solid #ddd"}),
+                                ]
+                            )
+                            for key, value in rows
+                        ]
+                    )
+                ],
+                style={"width": "100%", "borderCollapse": "collapse"},
+            ),
+        ],
+        style={"width": width},
+    )
+
+
+def _make_data_table(title: str, columns: list[str], rows: list[dict[str, str]], max_height: str = "320px") -> html.Div:
+    return html.Div(
+        [
+            html.H4(title, style={"margin": "0 0 8px 0"}),
+            html.Div(
+                html.Table(
+                    [
+                        html.Thead(html.Tr([html.Th(col, style={"padding": "6px 10px", "textAlign": "left", "borderBottom": "1px solid #ddd"}) for col in columns])),
+                        html.Tbody(
+                            [
+                                html.Tr([html.Td(row.get(col, "-"), style={"padding": "6px 10px", "borderBottom": "1px solid #eee"}) for col in columns])
+                                for row in rows
+                            ]
+                        ),
+                    ],
+                    style={"width": "100%", "borderCollapse": "collapse"},
+                ),
+                style={"overflowX": "auto", "maxHeight": max_height, "overflowY": "auto"},
+            ),
+        ],
+        style={"width": "100%"},
+    )
+
+
+def _make_quant_summary_figure(
+    x_values,
+    equity_values,
+    drawdown_values,
+    returns_values=None,
+    title="Quant Summary",
+    x_title: str = "Time",
+) -> go.Figure:
+    rows = 3 if returns_values is not None else 2
+    subplot_titles = ("Equity", "Drawdown") + (("Returns",) if returns_values is not None else ())
+    fig = make_subplots(rows=rows, cols=1, shared_xaxes=True, vertical_spacing=0.07, subplot_titles=subplot_titles)
+    fig.add_trace(
+        go.Scatter(
+            x=x_values,
+            y=equity_values,
+            mode="lines",
+            name="Equity",
+            line={"color": "#2563EB", "width": 2.0},
+            hovertemplate="equity=%{y}<extra></extra>",
+            showlegend=False,
+        ),
+        row=1,
+        col=1,
+    )
+    fig.add_trace(
+        go.Scatter(
+            x=x_values,
+            y=drawdown_values,
+            mode="lines",
+            name="Drawdown",
+            line={"color": "#C2410C", "width": 2.0},
+            hovertemplate="drawdown=%{y:.2%}<extra></extra>",
+            showlegend=False,
+        ),
+        row=2,
+        col=1,
+    )
+    if returns_values is not None:
+        colors = ["#0F766E" if float(v) >= 0 else "#DC2626" for v in returns_values]
+        fig.add_trace(
+            go.Bar(
+                x=x_values,
+                y=returns_values,
+                marker={"color": colors},
+                name="Returns",
+                hovertemplate="return=%{y:.2%}<extra></extra>",
+                showlegend=False,
+            ),
+            row=3,
+            col=1,
+        )
+    fig.update_yaxes(title="Equity", row=1, col=1, automargin=True)
+    fig.update_yaxes(title="Drawdown", tickformat=".1%", row=2, col=1, automargin=True)
+    if returns_values is not None:
+        fig.update_yaxes(title="Returns", tickformat=".1%", row=3, col=1, automargin=True)
+        fig.update_xaxes(title=x_title, row=3, col=1)
+    else:
+        fig.update_xaxes(title=x_title, row=2, col=1)
+    fig.update_layout(template="plotly_white", height=420 if returns_values is None else 560, title=title, margin={"l": 18, "r": 18, "t": 60, "b": 40}, hovermode="x unified")
+    return fig
+
+
+def _make_report_panel(title: str, summary_rows: list[tuple[str, str]], figure: go.Figure, breakdown: html.Div | None = None) -> html.Div:
+    children = [
+        html.H3(title, style={"margin": "0 0 12px 0"}),
+        html.Div(
+            [
+                html.Div(_make_stats_table("Summary", summary_rows, width="100%"), style={"flex": "0 0 340px", "minWidth": "280px"}),
+                html.Div(
+                    dcc.Graph(figure=figure, config={"displayModeBar": False}),
+                    style={"flex": "1 1 640px", "minWidth": "0"},
+                ),
+            ],
+            style={"display": "flex", "gap": "16px", "alignItems": "stretch", "flexWrap": "wrap"},
+        ),
+    ]
+    if breakdown is not None:
+        children.append(html.Div(breakdown, style={"marginTop": "14px"}))
+    return html.Div(
+        children,
+        style={
+            "margin": "0 12px 14px 12px",
+            "padding": "12px",
+            "border": "1px solid #e5e7eb",
+            "borderRadius": "10px",
+            "background": "#fafafa",
+        },
+    )
 
 
 def first_mid_price(state_df: pd.DataFrame) -> float | None:
@@ -963,7 +1238,7 @@ def render_index() -> html.Div:
     grouped_heads = discover_heads()
     sections: list = [
         html.H2("Simulation Heads"),
-        html.P("Click a date to open daily metrics. From there, open the hourly bid/ask + order chart."),
+        html.P("Click a symbol for the multi-day overview, or a date for daily metrics. From there, open the hourly bid/ask + order chart."),
     ]
     for root_name in ROOT_ORDER:
         heads = grouped_heads.get(root_name, [])
@@ -1000,7 +1275,12 @@ def render_index() -> html.Div:
                 symbol_blocks.append(
                     html.Div(
                         [
-                            html.Span(symbol, style={"fontWeight": "bold", "marginRight": "10px"}),
+                            html.A(
+                                symbol,
+                                href=f"/symbol?head={quote(str(head))}&symbol={quote(symbol)}",
+                                target="_self",
+                                style={"fontWeight": "bold", "marginRight": "10px"},
+                            ),
                             html.Span("dates: ", style={"marginRight": "6px"}),
                             *links,
                         ],
@@ -1025,7 +1305,16 @@ def render_index() -> html.Div:
     return html.Div(sections, style={"maxWidth": "1200px", "margin": "0 auto", "padding": "16px"})
 
 
-def make_daily_figure(metrics_df: pd.DataFrame, state_df: pd.DataFrame, symbol: str, head: Path, date: str) -> go.Figure:
+def make_daily_figure(
+    metrics_df: pd.DataFrame,
+    state_df: pd.DataFrame,
+    symbol: str,
+    head: Path,
+    date: str,
+    *,
+    position_title: str = "Position (resets daily)",
+    title_suffix: str = "Daily Metrics",
+) -> go.Figure:
     metrics_df = _minute_last_frame(metrics_df)
     state_df = _minute_last_frame(state_df)
     fig = make_subplots(
@@ -1035,7 +1324,7 @@ def make_daily_figure(metrics_df: pd.DataFrame, state_df: pd.DataFrame, symbol: 
         vertical_spacing=0.045,
         row_heights=[0.25, 0.25, 0.25, 0.25],
         specs=[[{}], [{}], [{}], [{"secondary_y": True}]],
-        subplot_titles=("Position", "Mid Price", "PnL", "Cumulative Notional / Size"),
+        subplot_titles=(position_title, "Mid Price", "PnL", "Cumulative Notional / Size"),
     )
     series = (
         (1, "position", "#0F766E", False, "Position"),
@@ -1078,7 +1367,7 @@ def make_daily_figure(metrics_df: pd.DataFrame, state_df: pd.DataFrame, symbol: 
                 col=1,
             )
     fig.update_yaxes(
-        title={"text": "Position", "font": {"color": "#0F766E"}, "standoff": 2},
+        title={"text": position_title, "font": {"color": "#0F766E"}, "standoff": 2},
         tickfont={"color": "#0F766E"},
         row=1,
         col=1,
@@ -1099,7 +1388,7 @@ def make_daily_figure(metrics_df: pd.DataFrame, state_df: pd.DataFrame, symbol: 
         automargin=True,
     )
     fig.update_yaxes(
-        title={"text": "Cum Notional", "font": {"color": "#C2410C"}},
+        title={"text": "Cum Notional (continues across day)", "font": {"color": "#C2410C"}},
         tickfont={"color": "#C2410C"},
         row=4,
         col=1,
@@ -1130,7 +1419,7 @@ def make_daily_figure(metrics_df: pd.DataFrame, state_df: pd.DataFrame, symbol: 
     fig.update_layout(
         template="plotly_white",
         height=980,
-        title=f"{symbol} | {date} | {head} | Daily Metrics",
+        title=f"{symbol} | {date} | {head} | {title_suffix}",
         margin={"l": 18, "r": 85, "t": 70, "b": 50},
         hovermode="x unified",
     )
@@ -1171,8 +1460,50 @@ def render_day(search: str) -> html.Div:
         if metrics_df[col].dropna().empty:
             missing.append(col)
 
-    fig = make_daily_figure(metrics_df, state_df, symbol, head, date)
-    hour_options = [{"label": "all", "value": "all"}]
+    fig = make_daily_figure(
+        metrics_df,
+        state_df,
+        symbol,
+        head,
+        date,
+        position_title="Position (resets daily)",
+    )
+
+    report_df = _build_report_frame(metrics_df, state_df, 1)
+    report_section = None
+    if not report_df.empty:
+        day_capital = _power_of_ten_capital(float(pd.to_numeric(report_df["position_usd"], errors="coerce").fillna(0.0).abs().max()))
+        day_stats = _report_stats(report_df, day_capital)
+        pnl_series = pd.to_numeric(report_df["pnl"], errors="coerce").fillna(0.0)
+        equity_values = day_capital + pnl_series
+        drawdown_values = equity_values / equity_values.cummax() - 1.0
+        returns_values = pnl_series.diff().fillna(pnl_series.iloc[0]) / day_capital
+        return_stats = _return_series_stats(returns_values)
+        summary_rows = [
+            ("Capital", _format_usd(day_stats["capital"])),
+            ("Total PnL", _format_usd(day_stats["total_pnl"])),
+            ("Total Return", _format_pct(day_stats["total_return"])),
+            ("Max Drawdown", _format_pct(day_stats["max_drawdown"])),
+            ("Sharpe (per period)", _format_ratio(return_stats["sharpe"])),
+            ("Sortino (per period)", _format_ratio(return_stats["sortino"])),
+            ("Profit Factor", _format_ratio(return_stats["profit_factor"])),
+            ("Volatility", _format_pct(return_stats["volatility"])),
+            ("Win Rate", _format_pct(return_stats["win_rate"])),
+            ("Max Abs Position USD", _format_usd(day_stats["max_abs_position_usd"])),
+            ("Max Abs Position", _format_num(day_stats["max_abs_position"], digits=4)),
+            ("Samples", str(len(report_df))),
+            ("Window", f"{report_df['time'].iloc[0]} -> {report_df['time'].iloc[-1]}"),
+        ]
+        report_fig = _make_quant_summary_figure(
+            report_df["time"],
+            equity_values,
+            drawdown_values,
+            returns_values,
+            title=f"{symbol} | {date} | Quant Summary",
+            x_title="Time",
+        )
+        report_section = _make_report_panel("Daily Quant Summary", summary_rows, report_fig)
+    hour_options = [{"label": "Select hour", "value": "all"}]
     hour_options.extend({"label": f"{h}h", "value": f"{h}"} for h in available_hours)
     return html.Div(
         [
@@ -1194,8 +1525,168 @@ def render_day(search: str) -> html.Div:
                 f"Missing/empty metrics for this file: {', '.join(missing)}" if missing else "",
                 style={"margin": "0 12px 8px 12px", "color": "#a61e4d"},
             ),
+            report_section if report_section is not None else html.Div(),
             dcc.Store(id="day-nav-meta", data={"head": str(head), "symbol": symbol, "date": date}),
             dcc.Graph(id="daily-metrics-graph", figure=fig, style={"height": "88vh"}),
+        ]
+    )
+
+
+def render_symbol(search: str) -> html.Div:
+    query = parse_qs(search.lstrip("?"))
+    head_raw = unquote(query.get("head", [""])[0])
+    symbol = unquote(query.get("symbol", [""])[0])
+
+    head = normalize_head(head_raw)
+    if head is None:
+        return html.Div([html.H3("Invalid head path"), html.Pre(head_raw)])
+    if not symbol:
+        return html.Div([html.H3("Missing symbol"), html.Pre(search)])
+
+    state_entries = [entry for entry in state_files_for_head(head) if entry.symbol == symbol]
+    if not state_entries:
+        return html.Div([html.H3("No dates found for symbol"), html.Pre(symbol)])
+
+    state_entries.sort(key=lambda x: x.date)
+    bucket_minutes = max(1, len(state_entries))
+
+    metric_rows: list[pd.DataFrame] = []
+    state_rows: list[pd.DataFrame] = []
+    available_dates: list[str] = []
+    for entry in state_entries:
+        state_path = entry.path
+        metrics_df = load_daily_metrics_frame(str(state_path), state_path.stat().st_mtime_ns)
+        state_df = load_state_frame(str(state_path), state_path.stat().st_mtime_ns)
+        if metrics_df.empty or state_df.empty:
+            continue
+        metric_bucket = _bucket_last_frame(metrics_df, bucket_minutes)
+        state_bucket = _bucket_last_frame(state_df, bucket_minutes)
+        if metric_bucket.empty or state_bucket.empty:
+            continue
+        metric_rows.append(metric_bucket)
+        state_rows.append(state_bucket)
+        available_dates.append(entry.date)
+
+    if not metric_rows or not state_rows:
+        return html.Div([html.H3("No usable summary data"), html.Pre(symbol)])
+
+    summary_metrics_df = pd.concat(metric_rows, ignore_index=True)
+    summary_state_df = pd.concat(state_rows, ignore_index=True)
+    fig = make_daily_figure(
+        summary_metrics_df,
+        summary_state_df,
+        symbol,
+        head,
+        f"{available_dates[0]} - {available_dates[-1]}",
+        position_title="Position (resets daily)",
+        title_suffix="Symbol Overview",
+    )
+
+    date_options = [{"label": date, "value": date} for date in sorted(available_dates)]
+    latest_date = available_dates[-1]
+
+    day_reports: list[dict] = []
+    for entry in state_entries:
+        metrics_df = load_daily_metrics_frame(str(entry.path), entry.path.stat().st_mtime_ns)
+        state_df = load_state_frame(str(entry.path), entry.path.stat().st_mtime_ns)
+        report_df = _build_report_frame(metrics_df, state_df, 1)
+        if report_df.empty:
+            continue
+        day_max_abs_position_usd = float(pd.to_numeric(report_df["position_usd"], errors="coerce").fillna(0.0).abs().max())
+        day_capital = _power_of_ten_capital(day_max_abs_position_usd)
+        day_stats = _report_stats(report_df, day_capital)
+        day_pnl = float(day_stats["total_pnl"])
+        day_reports.append(
+            {
+                "date": entry.date,
+                "time": pd.to_datetime(entry.date, format="%Y%m%d"),
+                "pnl": day_pnl,
+                "return": day_pnl,  # normalized later once symbol capital is known
+                "max_drawdown": float(day_stats["max_drawdown"]),
+                "max_abs_position_usd": float(day_stats["max_abs_position_usd"]),
+                "max_abs_position": float(day_stats["max_abs_position"]),
+                "capital": float(day_capital),
+                "samples": int(len(report_df)),
+            }
+        )
+
+    symbol_report_section = None
+    if day_reports:
+        day_report_df = pd.DataFrame(day_reports).sort_values("date").reset_index(drop=True)
+        symbol_capital = _power_of_ten_capital(float(day_report_df["max_abs_position_usd"].max()))
+        day_report_df["return"] = day_report_df["pnl"] / symbol_capital
+        day_report_df["equity"] = symbol_capital + day_report_df["pnl"].cumsum()
+        day_report_df["drawdown"] = day_report_df["equity"] / day_report_df["equity"].cummax() - 1.0
+        return_stats = _return_series_stats(day_report_df["return"])
+
+        summary_rows = [
+            ("Capital", _format_usd(symbol_capital)),
+            ("Total PnL", _format_usd(float(day_report_df["pnl"].sum()))),
+            ("Total Return", _format_pct(float(day_report_df["pnl"].sum() / symbol_capital) if symbol_capital else 0.0)),
+            ("Max Drawdown", _format_pct(float(day_report_df["drawdown"].min()))),
+            ("Sharpe (per period)", _format_ratio(return_stats["sharpe"])),
+            ("Sortino (per period)", _format_ratio(return_stats["sortino"])),
+            ("Profit Factor", _format_ratio(return_stats["profit_factor"])),
+            ("Volatility", _format_pct(return_stats["volatility"])),
+            ("Days", str(len(day_report_df))),
+            ("Win Rate", _format_pct(float((day_report_df["pnl"] > 0).mean()))),
+            ("Avg Daily Return", _format_pct(float(day_report_df["return"].mean()))),
+            ("Best Day", f"{day_report_df.loc[day_report_df['pnl'].idxmax(), 'date']} ({_format_usd(float(day_report_df['pnl'].max()))})"),
+            ("Worst Day", f"{day_report_df.loc[day_report_df['pnl'].idxmin(), 'date']} ({_format_usd(float(day_report_df['pnl'].min()))})"),
+            ("Max Abs Position USD", _format_usd(float(day_report_df["max_abs_position_usd"].max()))),
+            ("Max Abs Position", _format_num(float(day_report_df["max_abs_position"].max()), digits=4)),
+        ]
+        report_fig = _make_quant_summary_figure(
+            day_report_df["time"],
+            day_report_df["equity"],
+            day_report_df["drawdown"],
+            day_report_df["return"],
+            title=f"{symbol} | Multi-day Quant Summary",
+            x_title="Date",
+        )
+        breakdown = _make_data_table(
+            "Daily Breakdown",
+            ["Date", "PnL", "Return", "Max DD", "Max Abs Pos USD", "Max Abs Pos", "Samples"],
+            [
+                {
+                    "Date": row["date"],
+                    "PnL": _format_usd(float(row["pnl"])),
+                    "Return": _format_pct(float(row["return"])),
+                    "Max DD": _format_pct(float(row["max_drawdown"])),
+                    "Max Abs Pos USD": _format_usd(float(row["max_abs_position_usd"])),
+                    "Max Abs Pos": _format_num(float(row["max_abs_position"]), digits=4),
+                    "Samples": str(int(row["samples"])),
+                }
+                for _, row in day_report_df.iterrows()
+            ],
+        )
+        symbol_report_section = _make_report_panel("Multi-day Quant Summary", summary_rows, report_fig, breakdown=breakdown)
+
+    return html.Div(
+        [
+            html.Div(
+                [
+                    html.A("Main page", href="/", target="_self", style={"marginRight": "12px"}),
+                    html.Span(f"Symbol: {symbol}", style={"marginRight": "12px", "fontWeight": "600"}),
+                    html.Span(f"Dates: {len(available_dates)}", style={"marginRight": "12px"}),
+                    dcc.Dropdown(
+                        id="symbol-date-dropdown",
+                        options=date_options,
+                        value=None,
+                        placeholder=f"Date (latest {latest_date})",
+                        clearable=False,
+                        style={"width": "160px", "display": "inline-block", "verticalAlign": "middle"},
+                    ),
+                ],
+                style={"margin": "8px 12px"},
+            ),
+            html.Div(
+                f"{symbol} | {head}",
+                style={"margin": "0 12px 6px 12px", "fontWeight": "600"},
+            ),
+            symbol_report_section if symbol_report_section is not None else html.Div(),
+            dcc.Store(id="symbol-nav-meta", data={"head": str(head), "symbol": symbol}),
+            dcc.Graph(id="symbol-overview-graph", figure=fig, style={"height": "88vh"}),
         ]
     )
 
@@ -1650,6 +2141,8 @@ app.layout = html.Div(
 
 @app.callback(Output("page-content", "children"), Input("url", "pathname"), Input("url", "search"))
 def route(pathname: str, search: str):
+    if pathname == "/symbol":
+        return render_symbol(search)
     if pathname == "/day":
         return render_day(search)
     if pathname == "/parent":
@@ -1694,6 +2187,39 @@ app.clientside_callback(
     Output("url", "href", allow_duplicate=True),
     Input("day-hour-dropdown", "value", allow_optional=True),
     State("day-nav-meta", "data", allow_optional=True),
+    prevent_initial_call=True,
+)
+
+
+app.clientside_callback(
+    """
+    function(dateValue, symbolNavMeta) {
+        const noUpdate = window.dash_clientside.no_update;
+        if (!dateValue) {
+            return noUpdate;
+        }
+
+        let head = "";
+        let symbol = "";
+        if (symbolNavMeta) {
+            head = String(symbolNavMeta.head || "");
+            symbol = String(symbolNavMeta.symbol || "");
+        }
+
+        if (!head || !symbol) {
+            return noUpdate;
+        }
+
+        const nextParams = new URLSearchParams();
+        nextParams.set("head", head);
+        nextParams.set("symbol", symbol);
+        nextParams.set("date", String(dateValue));
+        return "/day?" + nextParams.toString();
+    }
+    """,
+    Output("url", "href", allow_duplicate=True),
+    Input("symbol-date-dropdown", "value", allow_optional=True),
+    State("symbol-nav-meta", "data", allow_optional=True),
     prevent_initial_call=True,
 )
 
