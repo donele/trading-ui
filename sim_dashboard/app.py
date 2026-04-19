@@ -14,6 +14,7 @@ import pandas as pd
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 from dash import Input, Output, Patch, State, dcc, html, no_update
+import pyarrow.parquet as pq
 
 
 ROOT_ORDER = ("dumpsim", "livesim", "tradesim")
@@ -196,6 +197,26 @@ def format_interval_label(start: pd.Timestamp, end: pd.Timestamp) -> str:
     return f"{start_min.strftime('%H:%M')} - {end_min.strftime('%H:%M')}"
 
 
+def _minute_last_frame(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty or "time" not in df.columns:
+        return df
+    minute_df = df.copy()
+    minute_df["time"] = pd.to_datetime(minute_df["time"], errors="coerce")
+    minute_df = minute_df.dropna(subset=["time"]).sort_values("time")
+    minute_df["time"] = minute_df["time"].dt.floor("min")
+    minute_df = minute_df.groupby("time", as_index=False).last()
+    return minute_df
+
+
+def _slice_window(df: pd.DataFrame, start: pd.Timestamp, end: pd.Timestamp) -> pd.DataFrame:
+    if df.empty or "time" not in df.columns:
+        return df
+    sliced = df.copy()
+    sliced["time"] = pd.to_datetime(sliced["time"], errors="coerce")
+    sliced = sliced.dropna(subset=["time"])
+    return sliced[(sliced["time"] >= start) & (sliced["time"] <= end)]
+
+
 def first_mid_price(state_df: pd.DataFrame) -> float | None:
     if state_df.empty:
         return None
@@ -286,45 +307,44 @@ def build_bps_ticks(price_min: float, price_max: float, base_price: float, count
 
 
 @lru_cache(maxsize=32)
-def load_state_table(state_path_str: str, mtime_ns: int) -> pd.DataFrame:
-    del mtime_ns
-    return pd.read_parquet(Path(state_path_str))
-
-
-@lru_cache(maxsize=32)
 def load_state_frame(state_path_str: str, mtime_ns: int) -> pd.DataFrame:
-    df = load_state_table(state_path_str, mtime_ns).copy()
-    bid_col = "bid" if "bid" in df.columns else "bid_price"
-    ask_col = "ask" if "ask" in df.columns else "ask_price"
-    if bid_col not in df.columns or ask_col not in df.columns:
-        return pd.DataFrame(columns=["time", "bid", "ask"])
-    df = df[["time", bid_col, ask_col]].rename(columns={bid_col: "bid", ask_col: "ask"})
-    df["time"] = pd.to_datetime(df["time"], unit="us", errors="coerce")
-    for col in ("bid", "ask"):
-        df[col] = pd.to_numeric(df[col], errors="coerce")
-        # Filter obvious sentinel / invalid values.
-        df.loc[(df[col] <= 0) | (df[col] >= 1e12), col] = pd.NA
-    df = df.dropna(subset=["time"])
-    return df
+    state_path = Path(state_path_str)
+    for bid_col, ask_col in (("bid", "ask"), ("bid_price", "ask_price")):
+        try:
+            df = pd.read_parquet(state_path, columns=["time", bid_col, ask_col])
+        except (KeyError, ValueError):
+            continue
+        df = df.rename(columns={bid_col: "bid", ask_col: "ask"})
+        df["time"] = pd.to_datetime(df["time"], unit="us", errors="coerce")
+        for col in ("bid", "ask"):
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+            # Filter obvious sentinel / invalid values.
+            df.loc[(df[col] <= 0) | (df[col] >= 1e12), col] = pd.NA
+        df = df.dropna(subset=["time"])
+        return df
+    return pd.DataFrame(columns=["time", "bid", "ask"])
 
 
 @lru_cache(maxsize=32)
 def load_position_frame(state_path_str: str, mtime_ns: int) -> pd.DataFrame:
-    df = load_state_table(state_path_str, mtime_ns).copy()
-    pos_col = "position" if "position" in df.columns else ("pos" if "pos" in df.columns else None)
-    if pos_col is None:
-        return pd.DataFrame(columns=["time", "position"])
-    df = df[["time", pos_col]].rename(columns={pos_col: "position"})
-    df["time"] = pd.to_datetime(df["time"], unit="us", errors="coerce")
-    df["position"] = pd.to_numeric(df["position"], errors="coerce")
-    df = df.dropna(subset=["time"]).sort_values("time")
-    return df
+    state_path = Path(state_path_str)
+    for pos_col in ("position", "pos"):
+        try:
+            df = pd.read_parquet(state_path, columns=["time", pos_col])
+        except (KeyError, ValueError):
+            continue
+        df = df.rename(columns={pos_col: "position"})
+        df["time"] = pd.to_datetime(df["time"], unit="us", errors="coerce")
+        df["position"] = pd.to_numeric(df["position"], errors="coerce")
+        df = df.dropna(subset=["time"]).sort_values("time")
+        return df
+    return pd.DataFrame(columns=["time", "position"])
 
 
 @lru_cache(maxsize=32)
 def load_daily_metrics_frame(state_path_str: str, mtime_ns: int) -> pd.DataFrame:
-    df = load_state_table(state_path_str, mtime_ns).copy()
-    columns = df.columns.tolist()
+    state_path = Path(state_path_str)
+    columns = pq.ParquetFile(state_path).schema.names
 
     def pick_first(*candidates: str) -> str | None:
         for candidate in candidates:
@@ -354,7 +374,7 @@ def load_daily_metrics_frame(state_path_str: str, mtime_ns: int) -> pd.DataFrame
     if len(usecols) == 1:
         return pd.DataFrame(columns=["time", "position", "pnl", "cum_notional_traded", "cum_size_traded"])
 
-    df = df[usecols]
+    df = pd.read_parquet(state_path, columns=usecols)
     rename_map = {}
     if position_col:
         rename_map[position_col] = "position"
@@ -398,7 +418,26 @@ def _load_order_parquet(order_path: Path, symbol: str, mtime_ns: int) -> pd.Data
 @lru_cache(maxsize=32)
 def load_order_table(order_path_str: str, mtime_ns: int) -> pd.DataFrame:
     del mtime_ns
-    return pd.read_parquet(Path(order_path_str))
+    order_path = Path(order_path_str)
+    columns = pq.ParquetFile(order_path).schema.names
+    usecols = [
+        col
+        for col in (
+            "symbol",
+            "create_time",
+            "acked_time",
+            "last_update_time",
+            "parent_order_id",
+            "client_order_id",
+            "price",
+            "qty",
+            "side",
+            "avg_fill_price",
+            "filled_qty",
+        )
+        if col in columns
+    ]
+    return pd.read_parquet(order_path, columns=usecols)
 
 
 def _orders_from_parquet(order_path: Path, symbol: str, mtime_ns: int) -> list[dict]:
@@ -648,6 +687,7 @@ def _child_order_traces(
                 name=f"{side} {order['client_order_id']}",
                 showlegend=False,
                 line={"color": color, "width": line_width},
+                line_shape="hv",
                 customdata=[str(order.get("parent_order_id") or "")] * (2 if x1 > x0 else len(order_x)),
                 hovertemplate=order_hover,
             )
@@ -986,29 +1026,33 @@ def render_index() -> html.Div:
 
 
 def make_daily_figure(metrics_df: pd.DataFrame, state_df: pd.DataFrame, symbol: str, head: Path, date: str) -> go.Figure:
+    metrics_df = _minute_last_frame(metrics_df)
+    state_df = _minute_last_frame(state_df)
     fig = make_subplots(
-        rows=3,
+        rows=4,
         cols=1,
         shared_xaxes=True,
-        vertical_spacing=0.06,
-        specs=[[{"secondary_y": True}], [{}], [{"secondary_y": True}]],
-        subplot_titles=("Position", "PnL", "Cumulative Notional / Size"),
+        vertical_spacing=0.045,
+        row_heights=[0.25, 0.25, 0.25, 0.25],
+        specs=[[{}], [{}], [{}], [{"secondary_y": True}]],
+        subplot_titles=("Position", "Mid Price", "PnL", "Cumulative Notional / Size"),
     )
     series = (
         (1, "position", "#0F766E", False, "Position"),
-        (2, "pnl", "#2563EB", False, "PnL"),
-        (3, "cum_notional_traded", "#C2410C", False, "Cum Notional"),
-        (3, "cum_size_traded", "#7C3AED", True, "Cum Size"),
+        (3, "pnl", "#2563EB", False, "PnL"),
+        (4, "cum_notional_traded", "#C2410C", False, "Cum Notional"),
+        (4, "cum_size_traded", "#7C3AED", True, "Cum Size"),
     )
     for row_idx, col, color, secondary_y, label in series:
         y = pd.to_numeric(metrics_df[col], errors="coerce")
         fig.add_trace(
-            go.Scattergl(
+            go.Scatter(
                 x=metrics_df["time"],
                 y=y,
                 mode="lines",
                 name=label,
                 line={"color": color, "width": 1.6},
+                line_shape="hv",
                 showlegend=False,
                 hovertemplate=f"{label}=%{{y}}<extra></extra>",
             ),
@@ -1020,57 +1064,52 @@ def make_daily_figure(metrics_df: pd.DataFrame, state_df: pd.DataFrame, symbol: 
         mid = ((pd.to_numeric(state_df["bid"], errors="coerce") + pd.to_numeric(state_df["ask"], errors="coerce")) / 2.0).dropna()
         if not mid.empty:
             fig.add_trace(
-                go.Scattergl(
+                go.Scatter(
                     x=state_df.loc[mid.index, "time"],
                     y=mid,
                     mode="lines",
                     name="Mid Price",
                     line={"color": "#B45309", "width": 1.4},
+                    line_shape="hv",
                     showlegend=False,
                     hovertemplate="Mid Price=%{y}<extra></extra>",
                 ),
-                row=1,
+                row=2,
                 col=1,
-                secondary_y=True,
             )
     fig.update_yaxes(
         title={"text": "Position", "font": {"color": "#0F766E"}, "standoff": 2},
         tickfont={"color": "#0F766E"},
         row=1,
         col=1,
-        secondary_y=False,
-        ticklabelstandoff=2,
+        automargin=True,
+    )
+    fig.update_yaxes(
+        title={"text": "Mid Price", "font": {"color": "#B45309"}, "standoff": 2},
+        tickfont={"color": "#B45309"},
+        row=2,
+        col=1,
         automargin=True,
     )
     fig.update_yaxes(
         title={"text": "PnL", "font": {"color": "#2563EB"}},
         tickfont={"color": "#2563EB"},
-        row=2,
+        row=3,
         col=1,
-        secondary_y=False,
         automargin=True,
     )
     fig.update_yaxes(
         title={"text": "Cum Notional", "font": {"color": "#C2410C"}},
         tickfont={"color": "#C2410C"},
-        row=3,
+        row=4,
         col=1,
         secondary_y=False,
         automargin=True,
     )
     fig.update_yaxes(
-        title={"text": "Mid Price", "font": {"color": "#B45309"}, "standoff": 4},
-        tickfont={"color": "#B45309"},
-        row=1,
-        col=1,
-        secondary_y=True,
-        ticklabelstandoff=4,
-        automargin=True,
-    )
-    fig.update_yaxes(
         title={"text": "Cum Size", "font": {"color": "#7C3AED"}},
         tickfont={"color": "#7C3AED"},
-        row=3,
+        row=4,
         col=1,
         secondary_y=True,
         automargin=True,
@@ -1078,13 +1117,15 @@ def make_daily_figure(metrics_df: pd.DataFrame, state_df: pd.DataFrame, symbol: 
 
     fig.update_xaxes(row=1, col=1, domain=[0.02, 1.0])
     fig.update_xaxes(row=2, col=1, domain=[0.02, 1.0])
-    fig.update_xaxes(title="Time", row=3, col=1, domain=[0.02, 1.0])
+    fig.update_xaxes(row=3, col=1, domain=[0.02, 1.0])
+    fig.update_xaxes(title="Time", row=4, col=1, domain=[0.02, 1.0])
     fig.update_layout(
         yaxis={"side": "left", "position": 0.02, "automargin": True},
         yaxis2={"side": "right", "automargin": True},
         yaxis3={"side": "left", "position": 0.02, "automargin": True},
         yaxis4={"side": "right", "automargin": True},
         yaxis5={"side": "left", "position": 0.02, "automargin": True},
+        yaxis6={"side": "right", "automargin": True},
     )
     fig.update_layout(
         template="plotly_white",
@@ -1182,6 +1223,7 @@ def make_figure(
                 mode="lines",
                 name="Bid",
                 line={"color": "#9ec5fe", "width": 1.4},
+                line_shape="hv",
                 hoverinfo="skip",
             )
         )
@@ -1192,6 +1234,7 @@ def make_figure(
                 mode="lines",
                 name="Ask",
                 line={"color": "#ffc9c9", "width": 1.4},
+                line_shape="hv",
                 hoverinfo="skip",
             )
         )
@@ -1336,12 +1379,13 @@ def make_position_figure(
 ) -> go.Figure:
     fig = go.Figure()
     fig.add_trace(
-        go.Scattergl(
+        go.Scatter(
             x=position_df["time"],
             y=position_df["position"],
             mode="lines",
             name="Position",
             line={"color": "#2a9d8f", "width": 1.8},
+            line_shape="hv",
             hovertemplate="position=%{y}<extra></extra>",
         )
     )
@@ -1409,10 +1453,15 @@ def render_chart(search: str) -> html.Div:
     if window_end <= window_start:
         window_end = window_start + timedelta(hours=1)
 
+    state_window_df = _slice_window(state_df, window_start, window_end)
+    position_window_df = _slice_window(position_df, window_start, window_end)
+    orders_window = [o for o in orders if pd.to_datetime(o["end_ts_us"], unit="us") >= window_start and pd.to_datetime(o["start_ts_us"], unit="us") <= window_end]
+    fills_window = [f for f in fills if window_start <= pd.to_datetime(f["ts_us"], unit="us") <= window_end]
+
     fig = make_figure(
-        state_df,
-        orders,
-        fills,
+        state_window_df,
+        orders_window,
+        fills_window,
         base_mid_price,
         symbol,
         head,
@@ -1423,7 +1472,7 @@ def render_chart(search: str) -> html.Div:
         detailed_orders=False,
         detailed_fills=False,
     )
-    position_fig = make_position_figure(position_df, symbol, head, date, window_start, window_end)
+    position_fig = make_position_figure(position_window_df, symbol, head, date, window_start, window_end)
     initial_interval_text = format_interval_label(window_start, window_end)
     return html.Div(
         [
@@ -1524,10 +1573,15 @@ def render_parent(search: str) -> html.Div:
         if window_end <= window_start:
             window_end = window_start + timedelta(hours=1)
 
+    state_window_df = _slice_window(state_df, window_start, window_end)
+    position_window_df = _slice_window(position_df, window_start, window_end)
+    orders_window = [o for o in orders if pd.to_datetime(o["end_ts_us"], unit="us") >= window_start and pd.to_datetime(o["start_ts_us"], unit="us") <= window_end]
+    fills_window = [f for f in fills if window_start <= pd.to_datetime(f["ts_us"], unit="us") <= window_end]
+
     fig = make_figure(
-        state_df,
-        orders,
-        fills,
+        state_window_df,
+        orders_window,
+        fills_window,
         base_mid_price,
         symbol,
         head,
@@ -1538,7 +1592,7 @@ def render_parent(search: str) -> html.Div:
         detailed_orders=True,
         detailed_fills=True,
     )
-    position_fig = make_position_figure(position_df, symbol, head, date, window_start, window_end)
+    position_fig = make_position_figure(position_window_df, symbol, head, date, window_start, window_end)
     initial_interval_text = format_interval_label(window_start, window_end)
     hourly_href = (
         f"/chart?head={quote(str(head))}&symbol={quote(symbol)}&date={date}"
