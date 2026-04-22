@@ -234,14 +234,6 @@ def _last_row_frame(df: pd.DataFrame) -> pd.DataFrame:
     return last.tail(1)
 
 
-def _power_of_ten_capital(max_abs_position_usd: float) -> float:
-    target = 10.0 * max(0.0, float(max_abs_position_usd))
-    capital = 10.0
-    while capital <= target:
-        capital *= 10.0
-    return capital
-
-
 def _format_usd(value: float | int | None) -> str:
     if value is None or pd.isna(value):
         return "-"
@@ -258,6 +250,12 @@ def _format_pct(value: float | int | None, digits: int = 2) -> str:
     if value is None or pd.isna(value):
         return "-"
     return f"{float(value) * 100.0:.{digits}f}%"
+
+
+def _format_bps(value: float | int | None, digits: int = 2) -> str:
+    if value is None or pd.isna(value):
+        return "-"
+    return f"{float(value) * 10000.0:.{digits}f} bps"
 
 
 def _format_ratio(value: float | int | None, digits: int = 2) -> str:
@@ -300,6 +298,15 @@ def _build_report_frame(metrics_df: pd.DataFrame, state_df: pd.DataFrame, bucket
     return merged.dropna(subset=["mid"])
 
 
+def _report_total_notional_usd(report_df: pd.DataFrame) -> float:
+    if report_df.empty or "cum_notional_traded" not in report_df.columns:
+        return 0.0
+    notional = pd.to_numeric(report_df["cum_notional_traded"], errors="coerce").dropna()
+    if notional.empty:
+        return 0.0
+    return float(notional.iloc[-1])
+
+
 def _return_series_stats(returns: pd.Series) -> dict[str, float]:
     clean = pd.to_numeric(returns, errors="coerce").replace([float("inf"), float("-inf")], pd.NA).dropna()
     if clean.empty:
@@ -325,28 +332,35 @@ def _return_series_stats(returns: pd.Series) -> dict[str, float]:
     }
 
 
-def _report_stats(report_df: pd.DataFrame, capital: float) -> dict[str, float]:
+def _report_stats(report_df: pd.DataFrame, total_fees_usd: float = 0.0, total_notional_usd: float = 0.0) -> dict[str, float]:
     if report_df.empty:
         return {
-            "capital": capital,
             "total_pnl": 0.0,
             "total_return": 0.0,
+            "total_notional_usd": total_notional_usd,
+            "total_return_bps": 0.0,
+            "total_fees_usd": total_fees_usd,
+            "total_fees_bps": 0.0,
             "max_drawdown": 0.0,
             "max_abs_position_usd": 0.0,
             "max_abs_position": 0.0,
         }
 
     pnl = pd.to_numeric(report_df["pnl"], errors="coerce").fillna(0.0)
-    equity = capital + pnl
-    peak = equity.cummax()
-    drawdown = equity / peak - 1.0
+    equity = pnl
+    drawdown = equity - equity.cummax()
     position = pd.to_numeric(report_df["position"], errors="coerce").fillna(0.0)
     position_usd = pd.to_numeric(report_df["position_usd"], errors="coerce").fillna(0.0)
 
+    total_return = float(pnl.iloc[-1] / total_notional_usd) if total_notional_usd else 0.0
+    total_fees_bps = float(total_fees_usd / total_notional_usd) if total_notional_usd else 0.0
     return {
-        "capital": capital,
         "total_pnl": float(pnl.iloc[-1]),
-        "total_return": float(pnl.iloc[-1] / capital) if capital else 0.0,
+        "total_return": total_return,
+        "total_notional_usd": total_notional_usd,
+        "total_return_bps": total_return,
+        "total_fees_usd": float(total_fees_usd),
+        "total_fees_bps": total_fees_bps,
         "max_drawdown": float(drawdown.min()) if not drawdown.empty else 0.0,
         "max_abs_position_usd": float(position_usd.abs().max()) if not position_usd.empty else 0.0,
         "max_abs_position": float(position.abs().max()) if not position.empty else 0.0,
@@ -411,7 +425,7 @@ def _make_quant_summary_figure(
     x_title: str = "Time",
 ) -> go.Figure:
     rows = 3 if returns_values is not None else 2
-    subplot_titles = ("Equity", "Drawdown") + (("Returns",) if returns_values is not None else ())
+    subplot_titles = ("Equity", "Drawdown") + (("Period PnL",) if returns_values is not None else ())
     fig = make_subplots(rows=rows, cols=1, shared_xaxes=True, vertical_spacing=0.07, subplot_titles=subplot_titles)
     fig.add_trace(
         go.Scatter(
@@ -420,7 +434,7 @@ def _make_quant_summary_figure(
             mode="lines",
             name="Equity",
             line={"color": "#2563EB", "width": 2.0},
-            hovertemplate="equity=%{y}<extra></extra>",
+            hovertemplate="equity=%{y:$,.2f}<extra></extra>",
             showlegend=False,
         ),
         row=1,
@@ -433,7 +447,7 @@ def _make_quant_summary_figure(
             mode="lines",
             name="Drawdown",
             line={"color": "#C2410C", "width": 2.0},
-            hovertemplate="drawdown=%{y:.2%}<extra></extra>",
+            hovertemplate="drawdown=%{y:$,.2f}<extra></extra>",
             showlegend=False,
         ),
         row=2,
@@ -446,17 +460,17 @@ def _make_quant_summary_figure(
                 x=x_values,
                 y=returns_values,
                 marker={"color": colors},
-                name="Returns",
-                hovertemplate="return=%{y:.2%}<extra></extra>",
+                name="Period PnL",
+                hovertemplate="pnl=%{y:$,.2f}<extra></extra>",
                 showlegend=False,
             ),
             row=3,
             col=1,
         )
-    fig.update_yaxes(title="Equity", row=1, col=1, automargin=True)
-    fig.update_yaxes(title="Drawdown", tickformat=".1%", row=2, col=1, automargin=True)
+    fig.update_yaxes(title="Equity (USD)", row=1, col=1, automargin=True)
+    fig.update_yaxes(title="Drawdown (USD)", row=2, col=1, automargin=True)
     if returns_values is not None:
-        fig.update_yaxes(title="Returns", tickformat=".1%", row=3, col=1, automargin=True)
+        fig.update_yaxes(title="Period PnL (USD)", row=3, col=1, automargin=True)
         fig.update_xaxes(title=x_title, row=3, col=1)
     else:
         fig.update_xaxes(title=x_title, row=2, col=1)
@@ -691,6 +705,41 @@ def _load_order_parquet(order_path: Path, symbol: str, mtime_ns: int) -> pd.Data
 
 
 @lru_cache(maxsize=32)
+def load_total_fees(order_log_path_str: str, symbol: str, mtime_ns: int) -> float:
+    order_log_path = Path(order_log_path_str)
+    if order_log_path.suffix == ".parquet":
+        df = _load_order_parquet(order_log_path, symbol, mtime_ns)
+        if df.empty or "fees" not in df.columns:
+            return 0.0
+        fees = pd.to_numeric(df["fees"], errors="coerce").fillna(0.0)
+        return float(fees.sum())
+
+    del mtime_ns
+    total = 0.0
+    with order_log_path.open("r", encoding="utf-8", errors="replace") as f:
+        for line in f:
+            if symbol not in line:
+                continue
+            start = line.find("{")
+            end = line.rfind("}")
+            if start < 0 or end <= start:
+                continue
+            payload_raw = line[start : end + 1]
+            try:
+                payload = json.loads(payload_raw)
+            except json.JSONDecodeError:
+                continue
+            if payload.get("symbol") != symbol:
+                continue
+            fees = payload.get("fees", 0)
+            try:
+                total += float(fees)
+            except (TypeError, ValueError):
+                continue
+    return total
+
+
+@lru_cache(maxsize=32)
 def load_order_table(order_path_str: str, mtime_ns: int) -> pd.DataFrame:
     del mtime_ns
     order_path = Path(order_path_str)
@@ -709,6 +758,7 @@ def load_order_table(order_path_str: str, mtime_ns: int) -> pd.DataFrame:
             "side",
             "avg_fill_price",
             "filled_qty",
+            "fees",
         )
         if col in columns
     ]
@@ -1314,29 +1364,48 @@ def make_daily_figure(
     *,
     position_title: str = "Position (resets daily)",
     title_suffix: str = "Daily Metrics",
+    carry_pnl_across_days: bool = False,
 ) -> go.Figure:
     metrics_df = _minute_last_frame(metrics_df)
     state_df = _minute_last_frame(state_df)
+    merged = pd.merge(
+        metrics_df[[col for col in ("time", "position", "pnl", "cum_notional_traded", "cum_size_traded") if col in metrics_df.columns]],
+        state_df[[col for col in ("time", "bid", "ask") if col in state_df.columns]],
+        on="time",
+        how="inner",
+    )
     fig = make_subplots(
         rows=4,
         cols=1,
         shared_xaxes=True,
         vertical_spacing=0.045,
         row_heights=[0.25, 0.25, 0.25, 0.25],
-        specs=[[{}], [{}], [{}], [{"secondary_y": True}]],
-        subplot_titles=(position_title, "Mid Price", "PnL", "Cumulative Notional / Size"),
+        specs=[[{}], [{}], [{}], [{}]],
+        subplot_titles=(position_title, "Mid Price", "PnL", "Cumulative Notional"),
     )
     series = (
-        (1, "position", "#0F766E", False, "Position"),
-        (3, "pnl", "#2563EB", False, "PnL"),
+        (1, "notional_position", "#0F766E", False, "Notional Position"),
+        (3, "cum_pnl", "#2563EB", False, "Cum PnL"),
         (4, "cum_notional_traded", "#C2410C", False, "Cum Notional"),
-        (4, "cum_size_traded", "#7C3AED", True, "Cum Size"),
     )
+    if not merged.empty:
+        merged["mid"] = (pd.to_numeric(merged["bid"], errors="coerce") + pd.to_numeric(merged["ask"], errors="coerce")) / 2.0
+        merged["notional_position"] = pd.to_numeric(merged["position"], errors="coerce") * merged["mid"]
+        merged["pnl"] = pd.to_numeric(merged["pnl"], errors="coerce").fillna(0.0)
+        if carry_pnl_across_days:
+            merged["cum_pnl"] = merged["pnl"].cumsum()
+        else:
+            merged["cum_pnl"] = merged["pnl"]
     for row_idx, col, color, secondary_y, label in series:
-        y = pd.to_numeric(metrics_df[col], errors="coerce")
+        if col == "notional_position":
+            y = pd.to_numeric(merged[col], errors="coerce") if not merged.empty else pd.Series(dtype=float)
+            x_values = merged["time"] if not merged.empty else []
+        else:
+            y = pd.to_numeric(merged[col], errors="coerce") if not merged.empty and col in merged.columns else pd.to_numeric(metrics_df[col], errors="coerce")
+            x_values = merged["time"] if not merged.empty and col in merged.columns else metrics_df["time"]
         fig.add_trace(
             go.Scatter(
-                x=metrics_df["time"],
+                x=x_values,
                 y=y,
                 mode="lines",
                 name=label,
@@ -1347,7 +1416,6 @@ def make_daily_figure(
             ),
             row=row_idx,
             col=1,
-            secondary_y=secondary_y,
         )
     if not state_df.empty:
         mid = ((pd.to_numeric(state_df["bid"], errors="coerce") + pd.to_numeric(state_df["ask"], errors="coerce")) / 2.0).dropna()
@@ -1367,7 +1435,7 @@ def make_daily_figure(
                 col=1,
             )
     fig.update_yaxes(
-        title={"text": position_title, "font": {"color": "#0F766E"}, "standoff": 2},
+        title={"text": "Notional Position (USD)", "font": {"color": "#0F766E"}, "standoff": 2},
         tickfont={"color": "#0F766E"},
         row=1,
         col=1,
@@ -1381,26 +1449,17 @@ def make_daily_figure(
         automargin=True,
     )
     fig.update_yaxes(
-        title={"text": "PnL", "font": {"color": "#2563EB"}},
+        title={"text": "Cum PnL", "font": {"color": "#2563EB"}},
         tickfont={"color": "#2563EB"},
         row=3,
         col=1,
         automargin=True,
     )
     fig.update_yaxes(
-        title={"text": "Cum Notional (continues across day)", "font": {"color": "#C2410C"}},
+        title={"text": "Cum Notional", "font": {"color": "#C2410C"}},
         tickfont={"color": "#C2410C"},
         row=4,
         col=1,
-        secondary_y=False,
-        automargin=True,
-    )
-    fig.update_yaxes(
-        title={"text": "Cum Size", "font": {"color": "#7C3AED"}},
-        tickfont={"color": "#7C3AED"},
-        row=4,
-        col=1,
-        secondary_y=True,
         automargin=True,
     )
 
@@ -1410,11 +1469,9 @@ def make_daily_figure(
     fig.update_xaxes(title="Time", row=4, col=1, domain=[0.02, 1.0])
     fig.update_layout(
         yaxis={"side": "left", "position": 0.02, "automargin": True},
-        yaxis2={"side": "right", "automargin": True},
+        yaxis2={"side": "left", "position": 0.02, "automargin": True},
         yaxis3={"side": "left", "position": 0.02, "automargin": True},
-        yaxis4={"side": "right", "automargin": True},
-        yaxis5={"side": "left", "position": 0.02, "automargin": True},
-        yaxis6={"side": "right", "automargin": True},
+        yaxis4={"side": "left", "position": 0.02, "automargin": True},
     )
     fig.update_layout(
         template="plotly_white",
@@ -1453,6 +1510,7 @@ def render_day(search: str) -> html.Div:
     orders = []
     if order_path.exists():
         orders = load_orders(str(order_path), symbol, order_path.stat().st_mtime_ns)
+    total_fees_usd = load_total_fees(str(order_path), symbol, order_path.stat().st_mtime_ns) if order_path.exists() else 0.0
     available_hours = sorted({pd.to_datetime(o["start_ts_us"], unit="us").hour for o in orders})
 
     missing = []
@@ -1472,22 +1530,23 @@ def render_day(search: str) -> html.Div:
     report_df = _build_report_frame(metrics_df, state_df, 1)
     report_section = None
     if not report_df.empty:
-        day_capital = _power_of_ten_capital(float(pd.to_numeric(report_df["position_usd"], errors="coerce").fillna(0.0).abs().max()))
-        day_stats = _report_stats(report_df, day_capital)
+        day_total_notional_usd = _report_total_notional_usd(report_df)
+        day_stats = _report_stats(report_df, total_fees_usd=total_fees_usd, total_notional_usd=day_total_notional_usd)
         pnl_series = pd.to_numeric(report_df["pnl"], errors="coerce").fillna(0.0)
-        equity_values = day_capital + pnl_series
-        drawdown_values = equity_values / equity_values.cummax() - 1.0
-        returns_values = pnl_series.diff().fillna(pnl_series.iloc[0]) / day_capital
-        return_stats = _return_series_stats(returns_values)
+        equity_values = pnl_series
+        drawdown_values = equity_values - equity_values.cummax()
+        returns_values = equity_values.diff().fillna(equity_values.iloc[0])
+        return_stats = _return_series_stats(pnl_series.diff().fillna(pnl_series.iloc[0]) / day_total_notional_usd if day_total_notional_usd else pnl_series * 0.0)
         summary_rows = [
-            ("Capital", _format_usd(day_stats["capital"])),
+            ("Total Notional", _format_usd(day_stats["total_notional_usd"])),
             ("Total PnL", _format_usd(day_stats["total_pnl"])),
-            ("Total Return", _format_pct(day_stats["total_return"])),
-            ("Max Drawdown", _format_pct(day_stats["max_drawdown"])),
+            ("Total Return", _format_bps(day_stats["total_return"])),
+            ("Total Fees", _format_bps(day_stats["total_fees_bps"])),
+            ("Max Drawdown", _format_usd(day_stats["max_drawdown"])),
             ("Sharpe (per period)", _format_ratio(return_stats["sharpe"])),
             ("Sortino (per period)", _format_ratio(return_stats["sortino"])),
             ("Profit Factor", _format_ratio(return_stats["profit_factor"])),
-            ("Volatility", _format_pct(return_stats["volatility"])),
+            ("Volatility", _format_num(return_stats["volatility"], digits=4)),
             ("Win Rate", _format_pct(return_stats["win_rate"])),
             ("Max Abs Position USD", _format_usd(day_stats["max_abs_position_usd"])),
             ("Max Abs Position", _format_num(day_stats["max_abs_position"], digits=4)),
@@ -1570,79 +1629,96 @@ def render_symbol(search: str) -> html.Div:
     if not metric_rows or not state_rows:
         return html.Div([html.H3("No usable summary data"), html.Pre(symbol)])
 
-    summary_metrics_df = pd.concat(metric_rows, ignore_index=True)
-    summary_state_df = pd.concat(state_rows, ignore_index=True)
-    fig = make_daily_figure(
-        summary_metrics_df,
-        summary_state_df,
-        symbol,
-        head,
-        f"{available_dates[0]} - {available_dates[-1]}",
-        position_title="Position (resets daily)",
-        title_suffix="Symbol Overview",
-    )
-
     date_options = [{"label": date, "value": date} for date in sorted(available_dates)]
     latest_date = available_dates[-1]
 
+    symbol_report_frames: list[pd.DataFrame] = []
     day_reports: list[dict] = []
+    total_fees_usd = 0.0
+    total_notional_usd = 0.0
+    cumulative_pnl_offset = 0.0
     for entry in state_entries:
+        order_path = head / "log" / f"order.{entry.date}.parquet"
+        if not order_path.exists():
+            order_path = head / "log" / f"order.{entry.date}.log"
         metrics_df = load_daily_metrics_frame(str(entry.path), entry.path.stat().st_mtime_ns)
         state_df = load_state_frame(str(entry.path), entry.path.stat().st_mtime_ns)
-        report_df = _build_report_frame(metrics_df, state_df, 1)
+        report_df = _build_report_frame(metrics_df, state_df, bucket_minutes)
         if report_df.empty:
             continue
-        day_max_abs_position_usd = float(pd.to_numeric(report_df["position_usd"], errors="coerce").fillna(0.0).abs().max())
-        day_capital = _power_of_ten_capital(day_max_abs_position_usd)
-        day_stats = _report_stats(report_df, day_capital)
+        report_df = report_df.copy()
+        day_pnl_series = pd.to_numeric(report_df["pnl"], errors="coerce").fillna(0.0)
+        report_df["pnl_delta"] = day_pnl_series.diff().fillna(day_pnl_series.iloc[0])
+        report_df["pnl_cumulative"] = cumulative_pnl_offset + day_pnl_series
+        cumulative_pnl_offset = float(report_df["pnl_cumulative"].iloc[-1])
+        symbol_report_frames.append(report_df)
+        day_total_fees_usd = load_total_fees(str(order_path), symbol, order_path.stat().st_mtime_ns) if order_path.exists() else 0.0
+        day_total_notional_usd = _report_total_notional_usd(report_df)
+        total_fees_usd += day_total_fees_usd
+        total_notional_usd += day_total_notional_usd
+        day_stats = _report_stats(report_df, total_fees_usd=day_total_fees_usd, total_notional_usd=day_total_notional_usd)
         day_pnl = float(day_stats["total_pnl"])
         day_reports.append(
             {
                 "date": entry.date,
                 "time": pd.to_datetime(entry.date, format="%Y%m%d"),
                 "pnl": day_pnl,
-                "return": day_pnl,  # normalized later once symbol capital is known
+                "return": day_pnl / day_total_notional_usd if day_total_notional_usd else 0.0,
                 "max_drawdown": float(day_stats["max_drawdown"]),
                 "max_abs_position_usd": float(day_stats["max_abs_position_usd"]),
                 "max_abs_position": float(day_stats["max_abs_position"]),
-                "capital": float(day_capital),
+                "notional_usd": float(day_total_notional_usd),
                 "samples": int(len(report_df)),
             }
         )
 
     symbol_report_section = None
-    if day_reports:
+    if day_reports and symbol_report_frames:
         day_report_df = pd.DataFrame(day_reports).sort_values("date").reset_index(drop=True)
-        symbol_capital = _power_of_ten_capital(float(day_report_df["max_abs_position_usd"].max()))
-        day_report_df["return"] = day_report_df["pnl"] / symbol_capital
-        day_report_df["equity"] = symbol_capital + day_report_df["pnl"].cumsum()
-        day_report_df["drawdown"] = day_report_df["equity"] / day_report_df["equity"].cummax() - 1.0
-        return_stats = _return_series_stats(day_report_df["return"])
+        symbol_report_df = pd.concat(symbol_report_frames, ignore_index=True).sort_values("time").reset_index(drop=True)
+        symbol_overview_df = symbol_report_df.copy()
+        symbol_overview_df["pnl"] = pd.to_numeric(symbol_overview_df["pnl_cumulative"], errors="coerce").fillna(0.0)
+        fig = make_daily_figure(
+            symbol_overview_df,
+            symbol_overview_df,
+            symbol,
+            head,
+            f"{available_dates[0]} - {available_dates[-1]}",
+            position_title="Position (resets daily)",
+            title_suffix="Symbol Overview",
+        )
+        day_report_df["return"] = day_report_df["pnl"] / day_report_df["notional_usd"].replace(0, pd.NA)
+        symbol_period_pnl = pd.to_numeric(symbol_report_df["pnl_delta"], errors="coerce").fillna(0.0)
+        symbol_equity = pd.to_numeric(symbol_report_df["pnl_cumulative"], errors="coerce").fillna(0.0)
+        symbol_drawdown = symbol_equity - symbol_equity.cummax()
+        symbol_return_series = symbol_period_pnl / total_notional_usd if total_notional_usd else symbol_period_pnl * 0.0
+        return_stats = _return_series_stats(symbol_return_series)
 
         summary_rows = [
-            ("Capital", _format_usd(symbol_capital)),
+            ("Total Notional", _format_usd(total_notional_usd)),
             ("Total PnL", _format_usd(float(day_report_df["pnl"].sum()))),
-            ("Total Return", _format_pct(float(day_report_df["pnl"].sum() / symbol_capital) if symbol_capital else 0.0)),
-            ("Max Drawdown", _format_pct(float(day_report_df["drawdown"].min()))),
+            ("Total Return", _format_bps(float(day_report_df["pnl"].sum() / total_notional_usd) if total_notional_usd else 0.0)),
+            ("Total Fees", _format_bps(float(total_fees_usd / total_notional_usd) if total_notional_usd else 0.0)),
+            ("Max Drawdown", _format_usd(float(symbol_drawdown.min()))),
             ("Sharpe (per period)", _format_ratio(return_stats["sharpe"])),
             ("Sortino (per period)", _format_ratio(return_stats["sortino"])),
             ("Profit Factor", _format_ratio(return_stats["profit_factor"])),
-            ("Volatility", _format_pct(return_stats["volatility"])),
+            ("Volatility", _format_num(return_stats["volatility"], digits=4)),
             ("Days", str(len(day_report_df))),
-            ("Win Rate", _format_pct(float((day_report_df["pnl"] > 0).mean()))),
-            ("Avg Daily Return", _format_pct(float(day_report_df["return"].mean()))),
+            ("Win Rate", _format_pct(float((symbol_return_series > 0).mean()))),
+            ("Avg Daily Return", _format_bps(float(day_report_df["return"].mean()))),
             ("Best Day", f"{day_report_df.loc[day_report_df['pnl'].idxmax(), 'date']} ({_format_usd(float(day_report_df['pnl'].max()))})"),
             ("Worst Day", f"{day_report_df.loc[day_report_df['pnl'].idxmin(), 'date']} ({_format_usd(float(day_report_df['pnl'].min()))})"),
             ("Max Abs Position USD", _format_usd(float(day_report_df["max_abs_position_usd"].max()))),
             ("Max Abs Position", _format_num(float(day_report_df["max_abs_position"].max()), digits=4)),
         ]
         report_fig = _make_quant_summary_figure(
-            day_report_df["time"],
-            day_report_df["equity"],
-            day_report_df["drawdown"],
-            day_report_df["return"],
+            symbol_report_df["time"],
+            symbol_equity,
+            symbol_drawdown,
+            symbol_period_pnl,
             title=f"{symbol} | Multi-day Quant Summary",
-            x_title="Date",
+            x_title="Time",
         )
         breakdown = _make_data_table(
             "Daily Breakdown",
@@ -1661,6 +1737,16 @@ def render_symbol(search: str) -> html.Div:
             ],
         )
         symbol_report_section = _make_report_panel("Multi-day Quant Summary", summary_rows, report_fig, breakdown=breakdown)
+    else:
+        fig = make_daily_figure(
+            pd.DataFrame(),
+            pd.DataFrame(),
+            symbol,
+            head,
+            f"{available_dates[0]} - {available_dates[-1]}",
+            position_title="Position (resets daily)",
+            title_suffix="Symbol Overview",
+        )
 
     return html.Div(
         [
