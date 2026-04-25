@@ -595,13 +595,23 @@ def build_bps_ticks(price_min: float, price_max: float, base_price: float, count
     return price_ticks, labels
 
 
+def _read_parquet_frame(path: Path, columns: list[str] | None = None) -> pd.DataFrame:
+    table = pq.ParquetFile(path).read(columns=columns)
+    df = table.to_pandas()
+    if df.columns.has_duplicates:
+        df = df.loc[:, ~df.columns.duplicated()].copy()
+    return df
+
+
 @lru_cache(maxsize=32)
 def load_state_frame(state_path_str: str, mtime_ns: int) -> pd.DataFrame:
     state_path = Path(state_path_str)
     for bid_col, ask_col in (("bid", "ask"), ("bid_price", "ask_price")):
         try:
-            df = pd.read_parquet(state_path, columns=["time", bid_col, ask_col])
+            df = _read_parquet_frame(state_path, columns=["time", bid_col, ask_col])
         except (KeyError, ValueError):
+            continue
+        if not {"time", bid_col, ask_col}.issubset(df.columns):
             continue
         df = df.rename(columns={bid_col: "bid", ask_col: "ask"})
         df["time"] = pd.to_datetime(df["time"], unit="us", errors="coerce")
@@ -619,8 +629,10 @@ def load_position_frame(state_path_str: str, mtime_ns: int) -> pd.DataFrame:
     state_path = Path(state_path_str)
     for pos_col in ("position", "pos"):
         try:
-            df = pd.read_parquet(state_path, columns=["time", pos_col])
+            df = _read_parquet_frame(state_path, columns=["time", pos_col])
         except (KeyError, ValueError):
+            continue
+        if not {"time", pos_col}.issubset(df.columns):
             continue
         df = df.rename(columns={pos_col: "position"})
         df["time"] = pd.to_datetime(df["time"], unit="us", errors="coerce")
@@ -663,7 +675,7 @@ def load_daily_metrics_frame(state_path_str: str, mtime_ns: int) -> pd.DataFrame
     if len(usecols) == 1:
         return pd.DataFrame(columns=["time", "position", "pnl", "cum_notional_traded", "cum_size_traded"])
 
-    df = pd.read_parquet(state_path, columns=usecols)
+    df = _read_parquet_frame(state_path, columns=usecols)
     rename_map = {}
     if position_col:
         rename_map[position_col] = "position"
@@ -762,7 +774,7 @@ def load_order_table(order_path_str: str, mtime_ns: int) -> pd.DataFrame:
         )
         if col in columns
     ]
-    return pd.read_parquet(order_path, columns=usecols)
+    return _read_parquet_frame(order_path, columns=usecols)
 
 
 def _orders_from_parquet(order_path: Path, symbol: str, mtime_ns: int) -> list[dict]:
