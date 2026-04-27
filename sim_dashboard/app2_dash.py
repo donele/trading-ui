@@ -76,10 +76,19 @@ def discover_heads() -> dict[str, list[Path]]:
             state_dir = log_dir / "state"
             if not state_dir.is_dir():
                 continue
-            if not any(log_dir.glob("order.????????.parquet")) and not any(log_dir.glob("order.????????.log")):
+            if not any(log_dir.glob("order.????????.parquet")):
                 continue
-            grouped[root_name].append(log_dir.parent)
-        grouped[root_name].sort()
+            head = log_dir.parent
+            if not state_files_for_head(head):
+                continue
+            grouped[root_name].append(head)
+        grouped[root_name].sort(
+            key=lambda head: (
+                max((row["date"] for row in state_files_for_head(head)), default=""),
+                str(head),
+            ),
+            reverse=True,
+        )
     return grouped
 
 
