@@ -358,6 +358,219 @@ def _page_shell(title: str, body) -> html.Div:
     )
 
 
+def _daily_symbol_summary(simdata: SimData, symbol: str) -> pd.DataFrame:
+    rows = []
+    for date in simdata.sdates:
+        timeline = simdata.get_timeline(symbol, date)
+        if timeline.empty:
+            continue
+        final = timeline.iloc[-1]
+        rows.append(
+            {
+                "date": date,
+                "pnl": float(pd.to_numeric(final.get("pnl"), errors="coerce") or 0.0),
+                "notional_traded": float(pd.to_numeric(final.get("notional_traded"), errors="coerce") or 0.0),
+                "notional_pos": float(pd.to_numeric(final.get("notional_pos"), errors="coerce") or 0.0),
+                "fees": float(pd.to_numeric(final.get("fees"), errors="coerce") or 0.0),
+                "size_traded": float(pd.to_numeric(final.get("size_traded"), errors="coerce") or 0.0),
+            }
+        )
+    return pd.DataFrame(rows).sort_values("date").reset_index(drop=True) if rows else pd.DataFrame()
+
+
+def _daily_portfolio_summary(simdata: SimData) -> pd.DataFrame:
+    rows = []
+    for date in simdata.sdates:
+        timelines = simdata.get_timelines(date)
+        if not timelines:
+            continue
+        totals: dict[str, float] = {"notional_traded": 0.0, "notional_pos": 0.0, "pnl": 0.0, "fees": 0.0, "size_traded": 0.0}
+        for timeline in timelines.values():
+            if timeline.empty:
+                continue
+            final = timeline.iloc[-1]
+            for col in totals:
+                value = pd.to_numeric(final.get(col), errors="coerce")
+                if pd.notna(value):
+                    totals[col] += float(value)
+        rows.append({"date": date, **totals})
+    return pd.DataFrame(rows).sort_values("date").reset_index(drop=True) if rows else pd.DataFrame()
+
+
+def _stats_bucket_minutes(simdata: SimData) -> int:
+    return max(5, 5 * max(1, len(simdata.sdates)))
+
+
+def _combined_stats_timeline(simdata: SimData, symbol: str | None, freq_minutes: int) -> pd.DataFrame:
+    frames = []
+    pnl_offset = 0.0
+    if symbol:
+        for date in simdata.sdates:
+            timeline = simdata.get_timeline(symbol, date, freq="5min")
+            if not timeline.empty:
+                timeline = timeline.copy()
+                if "pnl" in timeline.columns:
+                    pnl_series = pd.to_numeric(timeline["pnl"], errors="coerce").fillna(0.0)
+                    timeline["pnl"] = pnl_offset + pnl_series
+                    pnl_offset = float(timeline["pnl"].iloc[-1])
+                frames.append(timeline)
+    else:
+        for date in simdata.sdates:
+            timelines = simdata.get_timelines(date, freq="5min")
+            if not timelines:
+                continue
+            totals = []
+            for timeline in timelines.values():
+                if not timeline.empty:
+                    totals.append(timeline)
+            if totals:
+                combined_day = pd.concat(totals).sort_index()
+                if combined_day.index.has_duplicates:
+                    combined_day = combined_day.groupby(level=0).sum(numeric_only=True)
+                if "pnl" in combined_day.columns:
+                    combined_day = combined_day.copy()
+                    pnl_series = pd.to_numeric(combined_day["pnl"], errors="coerce").fillna(0.0)
+                    combined_day["pnl"] = pnl_offset + pnl_series
+                    pnl_offset = float(combined_day["pnl"].iloc[-1])
+                frames.append(combined_day)
+    if not frames:
+        return pd.DataFrame()
+    combined = pd.concat(frames).sort_index()
+    if combined.index.has_duplicates:
+        combined = combined.groupby(level=0).last()
+    freq = f"{freq_minutes}min"
+    # Use the first sample in each bucket so the timestamp labels reflect
+    # bucket-start values on the step chart, especially across day resets.
+    combined = combined.resample(freq).first().ffill()
+    return combined
+
+
+def _make_stats_figure(timeline_df: pd.DataFrame, title: str) -> go.Figure:
+    fig = make_subplots(
+        rows=3,
+        cols=1,
+        shared_xaxes=True,
+        vertical_spacing=0.06,
+        subplot_titles=("PnL", "Notional Traded", "Notional Position"),
+    )
+    if not timeline_df.empty:
+        x = timeline_df.index
+        fig.add_trace(
+            go.Scatter(
+                x=x,
+                y=pd.to_numeric(timeline_df["pnl"], errors="coerce"),
+                mode="lines",
+                name="pnl",
+                line={"color": "#2563EB", "width": 1.5},
+                line_shape="hv",
+                hovertemplate="pnl=%{y}<extra></extra>",
+                showlegend=False,
+            ),
+            row=1,
+            col=1,
+        )
+        fig.add_trace(
+            go.Scatter(
+                x=x,
+                y=pd.to_numeric(timeline_df["notional_traded"], errors="coerce"),
+                mode="lines",
+                name="notional traded",
+                line={"color": "#C2410C", "width": 1.5},
+                line_shape="hv",
+                hovertemplate="notional_traded=%{y}<extra></extra>",
+                showlegend=False,
+            ),
+            row=2,
+            col=1,
+        )
+        fig.add_trace(
+            go.Scatter(
+                x=x,
+                y=pd.to_numeric(timeline_df["notional_pos"], errors="coerce"),
+                mode="lines",
+                name="notional position",
+                line={"color": "#0F766E", "width": 1.5},
+                line_shape="hv",
+                hovertemplate="notional_pos=%{y}<extra></extra>",
+                showlegend=False,
+            ),
+            row=3,
+            col=1,
+        )
+    fig.update_layout(
+        template="plotly_white",
+        height=780,
+        title=title,
+        hovermode="x unified",
+        margin={"l": 18, "r": 18, "t": 70, "b": 40},
+    )
+    fig.update_xaxes(title="Date", row=3, col=1)
+    for row_idx in (1, 2, 3):
+        fig.update_yaxes(automargin=True, row=row_idx, col=1)
+    return fig
+
+
+def render_stats(search: str) -> html.Div:
+    query = parse_qs(search.lstrip("?"))
+    head, symbol, _ = _resolve_head_symbol_date(query, require_symbol=False)
+    if head is None:
+        return _page_shell("Invalid head", html.Pre(unquote(query.get("head", [""])[0])))
+    simdata = SimData(str(head))
+    if symbol:
+        summary_df = _daily_symbol_summary(simdata, symbol)
+        bucket_minutes = _stats_bucket_minutes(simdata)
+        chart_df = _combined_stats_timeline(simdata, symbol, bucket_minutes)
+        title = f"Quant Stats | {symbol} | {head}"
+    else:
+        summary_df = _daily_portfolio_summary(simdata)
+        bucket_minutes = _stats_bucket_minutes(simdata)
+        chart_df = _combined_stats_timeline(simdata, None, bucket_minutes)
+        title = f"Portfolio Quant Stats | {head}"
+    if summary_df.empty:
+        return _page_shell("No data", html.Pre(symbol or str(head)))
+    summary_df = summary_df.copy()
+    summary_df["date_ts"] = pd.to_datetime(summary_df["date"], format="%Y%m%d", errors="coerce")
+    summary_df["cum_pnl"] = pd.to_numeric(summary_df["pnl"], errors="coerce").fillna(0.0).cumsum()
+    summary_df["drawdown"] = summary_df["cum_pnl"] - summary_df["cum_pnl"].cummax()
+    summary_df["abs_pos"] = pd.to_numeric(summary_df["notional_pos"], errors="coerce").abs()
+    fig = _make_stats_figure(chart_df, title)
+    total_pnl = float(pd.to_numeric(summary_df["pnl"], errors="coerce").fillna(0.0).sum())
+    total_notional = float(pd.to_numeric(summary_df["notional_traded"], errors="coerce").fillna(0.0).sum())
+    win_rate = float((pd.to_numeric(summary_df["pnl"], errors="coerce").fillna(0.0) > 0).mean())
+    summary_line = html.Div(
+        [
+            html.A("Home", href="/", style={"marginRight": "12px"}),
+            html.Span(f"Days: {len(summary_df)}", style={"marginRight": "12px"}),
+            html.Span(f"Total PnL: {total_pnl:,.2f}", style={"marginRight": "12px"}),
+            html.Span(f"Total Notional: {total_notional:,.2f}", style={"marginRight": "12px"}),
+            html.Span(f"Win Rate: {win_rate:.1%}", style={"marginRight": "12px"}),
+            html.Span(f"Chart Interval: {bucket_minutes} min", style={"marginRight": "12px"}),
+        ],
+        style={"marginBottom": "10px"},
+    )
+    table_rows = []
+    for row in summary_df.itertuples(index=False):
+        table_rows.append(
+            html.Tr(
+                [
+                    html.Td(row.date),
+                    html.Td(f"{float(row.pnl):,.2f}"),
+                    html.Td(f"{float(row.notional_traded):,.2f}"),
+                    html.Td(f"{float(row.notional_pos):,.2f}"),
+                    html.Td(f"{float(row.fees):,.2f}"),
+                ]
+            )
+        )
+    table = html.Table(
+        [
+            html.Thead(html.Tr([html.Th("Date"), html.Th("PnL"), html.Th("Notional Traded"), html.Th("Notional Pos"), html.Th("Fees")])),
+            html.Tbody(table_rows),
+        ],
+        style={"width": "100%", "borderCollapse": "collapse", "marginTop": "12px"},
+    )
+    return _page_shell(title, html.Div([summary_line, dcc.Graph(figure=fig), table]))
+
+
 def render_index() -> html.Div:
     grouped = discover_heads()
     blocks = []
@@ -378,7 +591,7 @@ def render_index() -> html.Div:
                         [
                             html.A(
                                 "portfolio",
-                                href=f"/portfolio?head={quote(str(head))}&date={all_dates[-1]}",
+                                href=f"/stats?head={quote(str(head))}",
                                 style={"fontWeight": "600", "marginRight": "10px"},
                             ),
                             html.Span("dates: "),
@@ -400,7 +613,7 @@ def render_index() -> html.Div:
                 links = [
                     html.A(
                         symbol,
-                        href=f"/symbol?head={quote(str(head))}&symbol={quote(symbol)}&date={latest_date}",
+                        href=f"/stats?head={quote(str(head))}&symbol={quote(symbol)}",
                         style={"fontWeight": "600", "marginRight": "10px"},
                     )
                 ]
@@ -457,10 +670,11 @@ def render_portfolio(search: str) -> html.Div:
             return _page_shell("No dates", html.Pre(str(head)))
         date = simdata.sdates[-1]
     fig = make_portfolio_figure(simdata, date)
-    links = [
+    links = [html.A("Home", href="/", style={"marginRight": "12px"})]
+    links.extend(
         html.A(d, href=f"/portfolio?head={quote(str(head))}&date={d}", style={"marginRight": "10px"})
         for d in simdata.sdates
-    ]
+    )
     return _page_shell(
         f"Portfolio | {head}",
         html.Div(
@@ -514,7 +728,7 @@ def render_symbol(search: str) -> html.Div:
             html.Div(
                 [
                     html.A("Home", href="/", style={"marginRight": "12px"}),
-                    html.A("Portfolio", href=f"/portfolio?head={quote(str(head))}&date={date}", style={"marginRight": "12px"}),
+                    html.A("Portfolio", href=f"/stats?head={quote(str(head))}&symbol={quote(symbol)}", style={"marginRight": "12px"}),
                     html.Span(f"Symbol: {symbol}", style={"fontWeight": "600", "marginRight": "12px"}),
                     html.Span("Dates: "),
                     *date_links,
@@ -555,7 +769,7 @@ def render_chart(search: str) -> html.Div:
                     [
                         html.A("Home", href="/", style={"marginRight": "12px"}),
                         html.A("Symbol", href=f"/symbol?head={quote(str(head))}&symbol={quote(symbol)}&date={date}", style={"marginRight": "12px"}),
-                        html.A("Portfolio", href=f"/portfolio?head={quote(str(head))}&date={date}", style={"marginRight": "12px"}),
+                        html.A("Portfolio", href=f"/stats?head={quote(str(head))}&symbol={quote(symbol)}", style={"marginRight": "12px"}),
                     ],
                     style={"marginBottom": "10px"},
                 ),
@@ -575,6 +789,8 @@ def route(pathname: str | None, search: str | None):
     search = search or ""
     if pathname in (None, "/", ""):
         return render_index()
+    if pathname == "/stats":
+        return render_stats(search)
     if pathname == "/portfolio":
         return render_portfolio(search)
     if pathname == "/symbol":

@@ -69,9 +69,10 @@ class SimData:
         if self.dfs is None:
             return pd.DataFrame(columns=['size_traded', 'notional_traded', 'notional_pos', 'mid', 'pnl', 'fees'])
         try:
-            df_symbol = self.dfs.loc[symbol].loc[t1:t2]
+            df_symbol = self.dfs.loc[symbol]
         except KeyError:
             return pd.DataFrame(columns=['size_traded', 'notional_traded', 'notional_pos', 'mid', 'pnl', 'fees'])
+        df_symbol = df_symbol[(df_symbol.index >= t1) & (df_symbol.index < t2)]
         if df_symbol.empty:
             return pd.DataFrame(columns=['size_traded', 'notional_traded', 'notional_pos', 'mid', 'pnl', 'fees'])
         df1 = df_symbol.resample(freq).ffill()
