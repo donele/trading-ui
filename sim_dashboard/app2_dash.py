@@ -98,6 +98,88 @@ def _safe_series(df: pd.DataFrame, col: str) -> pd.Series:
     return pd.Series(dtype=float)
 
 
+def _format_num(value: float | int | None, digits: int = 2) -> str:
+    if value is None or pd.isna(value):
+        return "-"
+    return f"{float(value):,.{digits}f}"
+
+
+def _format_usd(value: float | int | None, digits: int = 2) -> str:
+    if value is None or pd.isna(value):
+        return "-"
+    return f"${float(value):,.{digits}f}"
+
+
+def _format_pct(value: float | int | None, digits: int = 2) -> str:
+    if value is None or pd.isna(value):
+        return "-"
+    return f"{float(value) * 100:.{digits}f}%"
+
+
+def _format_bps(value: float | int | None, digits: int = 2) -> str:
+    if value is None or pd.isna(value):
+        return "-"
+    return f"{float(value) * 10000:.{digits}f} bps"
+
+
+def _format_ratio(value: float | int | None, digits: int = 2) -> str:
+    if value is None or pd.isna(value):
+        return "-"
+    if value == float("inf"):
+        return "inf"
+    if value == float("-inf"):
+        return "-inf"
+    return f"{float(value):.{digits}f}"
+
+
+def _return_series_stats(returns: pd.Series, periods_per_year: float = 1.0) -> dict[str, float]:
+    clean = pd.to_numeric(returns, errors="coerce").replace([float("inf"), float("-inf")], pd.NA).dropna()
+    if clean.empty:
+        return {
+            "volatility": 0.0,
+            "sharpe": 0.0,
+            "sortino": 0.0,
+            "profit_factor": 0.0,
+            "win_rate": 0.0,
+        }
+    mean = float(clean.mean())
+    std = float(clean.std(ddof=0))
+    downside = clean[clean < 0]
+    downside_std = float(downside.std(ddof=0)) if not downside.empty else 0.0
+    positive_sum = float(clean[clean > 0].sum())
+    negative_sum = float(clean[clean < 0].sum())
+    annualization = periods_per_year ** 0.5 if periods_per_year > 0 else 1.0
+    return {
+        "volatility": std,
+        "sharpe": (mean / std) * annualization if std else 0.0,
+        "sortino": (mean / downside_std) * annualization if downside_std else 0.0,
+        "profit_factor": positive_sum / abs(negative_sum) if negative_sum < 0 else (float("inf") if positive_sum > 0 else 0.0),
+        "win_rate": float((clean > 0).mean()),
+    }
+
+
+def _make_stats_table(rows: list[tuple[str, str]]) -> html.Div:
+    return html.Div(
+        html.Table(
+            [
+                html.Tbody(
+                    [
+                        html.Tr(
+                            [
+                                html.Th(label, style={"textAlign": "left", "padding": "6px 10px", "borderBottom": "1px solid #e5e7eb"}),
+                                html.Td(value, style={"textAlign": "right", "padding": "6px 10px", "borderBottom": "1px solid #e5e7eb"}),
+                            ]
+                        )
+                        for label, value in rows
+                    ]
+                )
+            ],
+            style={"width": "100%", "borderCollapse": "collapse"},
+        ),
+        style={"width": "min(560px, 100%)", "marginBottom": "12px"},
+    )
+
+
 def _make_step_trace(
     x,
     y,
@@ -454,6 +536,30 @@ def _combined_stats_timeline(simdata: SimData, symbol: str | None, freq_minutes:
     return combined
 
 
+def _interval_pnl_series(simdata: SimData, symbol: str | None, freq_minutes: int) -> pd.Series:
+    pnl_deltas = []
+    freq = f"{freq_minutes}min"
+    for date in simdata.sdates:
+        if symbol:
+            timeline = simdata.get_timeline(symbol, date, freq=freq)
+        else:
+            timelines = simdata.get_timelines(date, freq=freq)
+            frames = [tl for tl in timelines.values() if not tl.empty]
+            if not frames:
+                continue
+            timeline = pd.concat(frames).sort_index()
+            if timeline.index.has_duplicates:
+                timeline = timeline.groupby(level=0).sum(numeric_only=True)
+        if timeline.empty:
+            continue
+        pnl = pd.to_numeric(timeline.get("pnl"), errors="coerce").fillna(0.0)
+        pnl_delta = pnl.diff().fillna(pnl.iloc[0])
+        pnl_deltas.append(pnl_delta)
+    if not pnl_deltas:
+        return pd.Series(dtype=float)
+    return pd.concat(pnl_deltas)
+
+
 def _make_stats_figure(timeline_df: pd.DataFrame, title: str) -> go.Figure:
     fig = make_subplots(
         rows=3,
@@ -543,19 +649,44 @@ def render_stats(search: str) -> html.Div:
     summary_df["drawdown"] = summary_df["cum_pnl"] - summary_df["cum_pnl"].cummax()
     summary_df["abs_pos"] = pd.to_numeric(summary_df["notional_pos"], errors="coerce").abs()
     fig = _make_stats_figure(chart_df, title)
-    total_pnl = float(pd.to_numeric(summary_df["pnl"], errors="coerce").fillna(0.0).sum())
-    total_notional = float(pd.to_numeric(summary_df["notional_traded"], errors="coerce").fillna(0.0).sum())
-    win_rate = float((pd.to_numeric(summary_df["pnl"], errors="coerce").fillna(0.0) > 0).mean())
-    summary_line = html.Div(
+    pnl_series = pd.to_numeric(summary_df["pnl"], errors="coerce").fillna(0.0)
+    notional_series = pd.to_numeric(summary_df["notional_traded"], errors="coerce").fillna(0.0)
+    fees_series = pd.to_numeric(summary_df["fees"], errors="coerce").fillna(0.0)
+    interval_pnl = _interval_pnl_series(simdata, symbol, bucket_minutes)
+    periods_per_year = (365.0 * 24.0 * 60.0) / float(bucket_minutes)
+    return_stats = _return_series_stats(interval_pnl, periods_per_year=periods_per_year)
+    total_pnl = float(pnl_series.sum())
+    total_notional = float(notional_series.sum())
+    total_fees = float(fees_series.sum())
+    total_return = float(total_pnl / total_notional) if total_notional else 0.0
+    total_fees_bps = float(total_fees / total_notional) if total_notional else 0.0
+    avg_return = total_return
+    max_drawdown = float(summary_df["drawdown"].min()) if not summary_df.empty else 0.0
+    max_abs_position = float(summary_df["abs_pos"].max()) if not summary_df.empty else 0.0
+    summary_nav = html.Div(
         [
             html.A("Home", href="/", style={"marginRight": "12px"}),
-            html.Span(f"Days: {len(summary_df)}", style={"marginRight": "12px"}),
-            html.Span(f"Total PnL: {total_pnl:,.2f}", style={"marginRight": "12px"}),
-            html.Span(f"Total Notional: {total_notional:,.2f}", style={"marginRight": "12px"}),
-            html.Span(f"Win Rate: {win_rate:.1%}", style={"marginRight": "12px"}),
-            html.Span(f"Chart Interval: {bucket_minutes} min", style={"marginRight": "12px"}),
+            html.Span(f"Chart Interval: {bucket_minutes} min"),
         ],
         style={"marginBottom": "10px"},
+    )
+    stats_table = _make_stats_table(
+        [
+            ("Days", str(len(summary_df))),
+            ("Total Notional", _format_usd(total_notional)),
+            ("Total PnL", _format_usd(total_pnl)),
+            ("PnL", _format_bps(total_return)),
+            ("Total Fees", _format_usd(total_fees)),
+            ("Fees", _format_bps(total_fees_bps)),
+            ("Sharpe (annualized)", _format_ratio(return_stats["sharpe"])),
+            ("Sortino (annualized)", _format_ratio(return_stats["sortino"])),
+            (f"Profit Factor ({bucket_minutes}m)", _format_ratio(return_stats["profit_factor"])),
+            (f"Volatility ({bucket_minutes}m)", _format_num(return_stats["volatility"], digits=4)),
+            (f"Win Rate ({bucket_minutes}m)", _format_pct(return_stats["win_rate"])),
+            ("Avg Return", _format_bps(avg_return)),
+            ("Max Drawdown", _format_usd(max_drawdown)),
+            ("Max Abs Position", _format_usd(max_abs_position)),
+        ]
     )
     table_rows = []
     for row in summary_df.itertuples(index=False):
@@ -577,7 +708,7 @@ def render_stats(search: str) -> html.Div:
         ],
         style={"width": "100%", "borderCollapse": "collapse", "marginTop": "12px"},
     )
-    return _page_shell(title, html.Div([summary_line, dcc.Graph(figure=fig), table]))
+    return _page_shell(title, html.Div([summary_nav, stats_table, dcc.Graph(figure=fig), table]))
 
 
 def render_index() -> html.Div:
