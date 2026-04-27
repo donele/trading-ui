@@ -4,6 +4,13 @@ import json
 from datetime import timedelta
 import pyarrow.parquet as pq
 
+def get_ref():
+    ref_path = '/home/jdlee/workspace/refdata/crypto_symbology/refdata.20260330.json'
+    with open(ref_path, 'r') as f:
+        ref0 = json.load(f)
+    ref = {x['flat_id']: x for x in ref0}
+    return ref
+
 def get_sim_sdates(head_dir):
     from pathlib import Path
 
@@ -39,6 +46,8 @@ class SimData:
         self.head_dir = head_dir
         self.sdates = get_sim_sdates(head_dir)
         self.symbols = get_sim_symbols(head_dir)
+        ref = get_ref()
+        self.multiplier_map = {symbol: float(ref[symbol]['contract_multiplier']) for symbol in self.symbols}
         self.dfo = None # Read from orders.<yyyymmdd>.parquet
         self.dfs = None # Read from <symbol>.0.<yyyymmdd>.parquet
     def load_order(self, sdate):
@@ -46,6 +55,7 @@ class SimData:
         if not exists:
             dfo = _read_parquet_frame(f'{self.head_dir}/log/order.{sdate}.parquet')
             dfo['create_datetime'] = pd.to_datetime(dfo.create_time, unit='us')
+            dfo['order_ntl'] = dfo.price * dfo.qty * dfo.symbol.map(self.multiplier_map)
             dfo = dfo.set_index(['symbol', 'create_datetime'])
             self.dfo = dfo if self.dfo is None else pd.concat([self.dfo, dfo]).sort_index()
     def load_state(self, symbol, sdate):
@@ -169,6 +179,8 @@ def plot_hour(simdata, symbol, sdate, hour):
     
     dfob['price'] = dfob.apply(lambda x: dfo1b[(dfo1b.create_time <= x.start_time) & (dfo1b.last_update_time >= x.end_time)].price.max(), axis=1)
     dfoa['price'] = dfoa.apply(lambda x: dfo1a[(dfo1a.create_time <= x.start_time) & (dfo1a.last_update_time >= x.end_time)].price.min(), axis=1)
+    dfob['order_ntl'] = dfob.apply(lambda x: dfo1b[(dfo1b.create_time <= x.start_time) & (dfo1b.last_update_time >= x.end_time)].order_ntl.sum(), axis=1)
+    dfoa['order_ntl'] = dfoa.apply(lambda x: dfo1a[(dfo1a.create_time <= x.start_time) & (dfo1a.last_update_time >= x.end_time)].order_ntl.sum(), axis=1)
 
     plt.figure(figsize=(20, 4))
 

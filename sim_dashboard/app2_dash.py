@@ -316,42 +316,99 @@ def _side_bucket(raw: object) -> str | None:
     return None
 
 
+def _build_order_segment_frame(df: pd.DataFrame, *, side: str) -> pd.DataFrame:
+    if df.empty or "create_time" not in df.columns or "last_update_time" not in df.columns or "price" not in df.columns:
+        return pd.DataFrame(columns=["start_time", "end_time", "price", "order_ntl"])
+    create_time = pd.to_numeric(df["create_time"], errors="coerce")
+    last_update_time = pd.to_numeric(df["last_update_time"], errors="coerce")
+    timepoints = pd.Index(pd.concat([create_time.dropna(), last_update_time.dropna()]).sort_values().unique())
+    if len(timepoints) < 2:
+        return pd.DataFrame(columns=["start_time", "end_time", "price", "order_ntl"])
+    prices = pd.to_numeric(df["price"], errors="coerce")
+    if "order_ntl" in df.columns:
+        order_ntl = pd.to_numeric(df["order_ntl"], errors="coerce").fillna(0.0)
+    else:
+        order_ntl = pd.Series(0.0, index=df.index)
+    segments = pd.DataFrame({"start_time": timepoints[:-1], "end_time": timepoints[1:]})
+
+    def _segment_price(row) -> float | None:
+        active = (create_time.reindex(df.index) <= row.start_time) & (last_update_time.reindex(df.index) >= row.end_time)
+        active_prices = prices[active].dropna()
+        if active_prices.empty:
+            return None
+        return float(active_prices.max() if side == "BUY" else active_prices.min())
+
+    def _segment_ntl(row) -> float:
+        active = (create_time.reindex(df.index) <= row.start_time) & (last_update_time.reindex(df.index) >= row.end_time)
+        return float(order_ntl[active].sum())
+
+    segments["price"] = segments.apply(_segment_price, axis=1)
+    segments["order_ntl"] = segments.apply(_segment_ntl, axis=1)
+    return segments.dropna(subset=["price"])
+
+
 def _make_order_segment_trace(df: pd.DataFrame, *, side: str, color: str) -> go.Scatter:
     xs = []
     ys = []
+    ntls = []
     if not df.empty:
         for row in df.itertuples(index=False):
-            start_ts = getattr(row, "create_time", None)
-            end_ts = getattr(row, "last_update_time", None)
+            start_ts = getattr(row, "start_time", None)
+            end_ts = getattr(row, "end_time", None)
             price = getattr(row, "price", None)
+            order_ntl = getattr(row, "order_ntl", None)
             if start_ts is None or end_ts is None or price is None:
                 continue
             try:
                 x0 = pd.to_datetime(int(start_ts), unit="us")
                 x1 = pd.to_datetime(int(end_ts), unit="us")
                 y = float(price)
+                ntl = float(order_ntl) if order_ntl is not None else float("nan")
             except (TypeError, ValueError):
                 continue
             if x1 <= x0:
                 x1 = x0 + timedelta(microseconds=1)
             xs.extend([x0, x1, None])
             ys.extend([y, y, None])
+            ntls.extend([ntl, ntl, None])
     return go.Scatter(
         x=xs,
         y=ys,
+        customdata=ntls,
         mode="lines",
         name=f"{side.lower()} order",
         line={"color": color, "width": 1.8},
         showlegend=True,
-        hovertemplate=f"{side.lower()} order=%{{y}}<extra></extra>",
+        hovertemplate=f"{side.lower()} order=%{{y}}<br>order_ntl=%{{customdata:,.2f}}<extra></extra>",
     )
+
+
+def _raw_hour_state_frame(simdata: SimData, symbol: str, sdate: str, hour: int) -> pd.DataFrame:
+    simdata.load_state(symbol, sdate)
+    t1 = pd.to_datetime(sdate, format="%Y%m%d").replace(hour=hour)
+    t2 = t1 + timedelta(hours=1)
+    if simdata.dfs is None:
+        return pd.DataFrame(columns=["bid", "ask", "notional_pos"])
+    try:
+        df_state = simdata.dfs.loc[symbol]
+    except KeyError:
+        return pd.DataFrame(columns=["bid", "ask", "notional_pos"])
+    df_state = df_state[(df_state.index >= t1) & (df_state.index < t2)]
+    return df_state
 
 
 def make_hour_figure(simdata: SimData, symbol: str, sdate: str, hour: int) -> go.Figure:
     dfo, dfbidask = simdata.get_orders_bid_ask(symbol, sdate, hour)
+    df_state = _raw_hour_state_frame(simdata, symbol, sdate, hour)
     t1 = pd.to_datetime(sdate, format="%Y%m%d").replace(hour=hour)
     t2 = t1 + timedelta(hours=1)
-    fig = go.Figure()
+    fig = make_subplots(
+        rows=2,
+        cols=1,
+        shared_xaxes=True,
+        vertical_spacing=0.05,
+        row_heights=[2, 1],
+    )
 
     if not dfbidask.empty:
         fig.add_trace(
@@ -363,7 +420,9 @@ def make_hour_figure(simdata: SimData, symbol: str, sdate: str, hour: int) -> go
                 line={"color": "#2563EB", "width": 1.2},
                 opacity=0.35,
                 hovertemplate="bid=%{y}<extra></extra>",
-            )
+            ),
+            row=1,
+            col=1,
         )
         fig.add_trace(
             go.Scatter(
@@ -374,7 +433,9 @@ def make_hour_figure(simdata: SimData, symbol: str, sdate: str, hour: int) -> go
                 line={"color": "#DC2626", "width": 1.2},
                 opacity=0.35,
                 hovertemplate="ask=%{y}<extra></extra>",
-            )
+            ),
+            row=1,
+            col=1,
         )
 
     if not dfo.empty:
@@ -385,10 +446,12 @@ def make_hour_figure(simdata: SimData, symbol: str, sdate: str, hour: int) -> go
             order_df["side_bucket"] = None
         buy_df = order_df[order_df["side_bucket"] == "BUY"]
         sell_df = order_df[order_df["side_bucket"] == "SELL"]
-        if not buy_df.empty:
-            fig.add_trace(_make_order_segment_trace(buy_df, side="BUY", color="#0F766E"))
-        if not sell_df.empty:
-            fig.add_trace(_make_order_segment_trace(sell_df, side="SELL", color="#C2410C"))
+        buy_segments = _build_order_segment_frame(buy_df, side="BUY")
+        sell_segments = _build_order_segment_frame(sell_df, side="SELL")
+        if not buy_segments.empty:
+            fig.add_trace(_make_order_segment_trace(buy_segments, side="BUY", color="#0F766E"), row=1, col=1)
+        if not sell_segments.empty:
+            fig.add_trace(_make_order_segment_trace(sell_segments, side="SELL", color="#C2410C"), row=1, col=1)
 
         if "filled_qty" in order_df.columns:
             filled_qty = pd.to_numeric(order_df["filled_qty"], errors="coerce").fillna(0)
@@ -413,7 +476,9 @@ def make_hour_figure(simdata: SimData, symbol: str, sdate: str, hour: int) -> go
                         name="buy fill",
                         marker={"symbol": "triangle-up", "color": "#1D4ED8", "size": 9},
                         hovertemplate="buy fill=%{y}<extra></extra>",
-                    )
+                    ),
+                    row=1,
+                    col=1,
                 )
             if not sell_fills.empty:
                 fig.add_trace(
@@ -424,14 +489,31 @@ def make_hour_figure(simdata: SimData, symbol: str, sdate: str, hour: int) -> go
                         name="sell fill",
                         marker={"symbol": "triangle-down", "color": "#DC2626", "size": 9},
                         hovertemplate="sell fill=%{y}<extra></extra>",
-                    )
+                    ),
+                    row=1,
+                    col=1,
                 )
 
-    fig.update_xaxes(range=[t1, t2], title="Time")
-    fig.update_yaxes(title="Price", automargin=True)
+    if not df_state.empty and "notional_pos" in df_state.columns:
+        fig.add_trace(
+            go.Scatter(
+                x=df_state.index,
+                y=_safe_series(df_state, "notional_pos"),
+                mode="lines",
+                name="notional position",
+                line={"color": "#6D28D9", "width": 1.4},
+                hovertemplate="notional_pos=%{y}<extra></extra>",
+            ),
+            row=2,
+            col=1,
+        )
+
+    fig.update_xaxes(range=[t1, t2], title="Time", row=2, col=1)
+    fig.update_yaxes(title="Price", automargin=True, row=1, col=1)
+    fig.update_yaxes(title="Notional Position", automargin=True, row=2, col=1)
     fig.update_layout(
         template="plotly_white",
-        height=420,
+        height=630,
         title=f"{symbol} | {sdate} | {hour:02d}:00",
         hovermode="x unified",
         margin={"l": 18, "r": 18, "t": 70, "b": 40},
@@ -880,7 +962,7 @@ def render_symbol(search: str) -> html.Div:
                 [
                     html.H4("Hourly View", style={"margin": "10px 0 8px 0"}),
                     html.Div([html.Span("Hours: "), *hour_links], style={"marginBottom": "8px"}),
-                    dcc.Graph(figure=hour_fig, style={"height": "40vh"}),
+                    dcc.Graph(figure=hour_fig, style={"height": "60vh"}),
                 ],
                 style={"marginTop": "12px"},
             ),
@@ -913,7 +995,7 @@ def render_chart(search: str) -> html.Div:
                     ],
                     style={"marginBottom": "10px"},
                 ),
-                dcc.Graph(figure=fig, style={"height": "72vh"}),
+                dcc.Graph(figure=fig, style={"height": "78vh"}),
             ]
         ),
     )
