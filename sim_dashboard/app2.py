@@ -75,7 +75,7 @@ class SimData:
         df_symbol = df_symbol[(df_symbol.index >= t1) & (df_symbol.index < t2)]
         if df_symbol.empty:
             return pd.DataFrame(columns=['size_traded', 'notional_traded', 'notional_pos', 'mid', 'pnl', 'fees'])
-        df1 = df_symbol.resample(freq).ffill()
+        df1 = df_symbol.resample(freq, label='right').last().ffill()
         df1['mid'] = df1[['bid', 'ask']].mean(axis=1)
         df1 = df1[['size_traded', 'notional_traded', 'notional_pos', 'mid', 'pnl', 'fees']]
         return df1
