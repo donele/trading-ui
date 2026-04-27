@@ -273,7 +273,7 @@ def _build_report_frame(metrics_df: pd.DataFrame, state_df: pd.DataFrame, bucket
     if metrics_df.empty or state_df.empty:
         return pd.DataFrame()
 
-    metrics_cols = [col for col in ("time", "position", "pnl", "cum_notional_traded", "cum_size_traded") if col in metrics_df.columns]
+    metrics_cols = [col for col in ("time", "pos", "notional", "pnl", "cum_notional_traded", "cum_size_traded", "contract_multiplier") if col in metrics_df.columns]
     state_cols = [col for col in ("time", "bid", "ask") if col in state_df.columns]
     if len(metrics_cols) < 2 or len(state_cols) < 3:
         return pd.DataFrame()
@@ -289,19 +289,32 @@ def _build_report_frame(metrics_df: pd.DataFrame, state_df: pd.DataFrame, bucket
 
     merged["time"] = pd.to_datetime(merged["time"], errors="coerce")
     merged = merged.dropna(subset=["time"]).sort_values("time")
-    merged["position"] = pd.to_numeric(merged.get("position"), errors="coerce")
+    merged["pos"] = pd.to_numeric(merged.get("pos"), errors="coerce")
+    if "notional" in merged.columns:
+        merged["notional"] = pd.to_numeric(merged.get("notional"), errors="coerce")
     merged["pnl"] = pd.to_numeric(merged.get("pnl"), errors="coerce")
     merged["cum_notional_traded"] = pd.to_numeric(merged.get("cum_notional_traded"), errors="coerce")
     merged["cum_size_traded"] = pd.to_numeric(merged.get("cum_size_traded"), errors="coerce")
+    if "contract_multiplier" in merged.columns:
+        merged["contract_multiplier"] = pd.to_numeric(merged.get("contract_multiplier"), errors="coerce")
+    else:
+        merged["contract_multiplier"] = 1.0
     merged["mid"] = (pd.to_numeric(merged["bid"], errors="coerce") + pd.to_numeric(merged["ask"], errors="coerce")) / 2.0
-    merged["position_usd"] = merged["position"].abs() * merged["mid"]
+    if "notional" in merged.columns and merged["notional"].notna().any():
+        merged["position_usd"] = merged["notional"].abs()
+    else:
+        merged["position_usd"] = merged["pos"].abs() * merged["mid"]
+    if merged["cum_size_traded"].notna().any():
+        merged["cum_notional_usd"] = merged["cum_size_traded"].abs() * merged["mid"] * merged["contract_multiplier"].fillna(1.0)
+    else:
+        merged["cum_notional_usd"] = merged["cum_notional_traded"].abs()
     return merged.dropna(subset=["mid"])
 
 
 def _report_total_notional_usd(report_df: pd.DataFrame) -> float:
-    if report_df.empty or "cum_notional_traded" not in report_df.columns:
+    if report_df.empty or "cum_notional_usd" not in report_df.columns:
         return 0.0
-    notional = pd.to_numeric(report_df["cum_notional_traded"], errors="coerce").dropna()
+    notional = pd.to_numeric(report_df["cum_notional_usd"], errors="coerce").dropna()
     if notional.empty:
         return 0.0
     return float(notional.iloc[-1])
@@ -349,7 +362,7 @@ def _report_stats(report_df: pd.DataFrame, total_fees_usd: float = 0.0, total_no
     pnl = pd.to_numeric(report_df["pnl"], errors="coerce").fillna(0.0)
     equity = pnl
     drawdown = equity - equity.cummax()
-    position = pd.to_numeric(report_df["position"], errors="coerce").fillna(0.0)
+    position = pd.to_numeric(report_df["pos"], errors="coerce").fillna(0.0)
     position_usd = pd.to_numeric(report_df["position_usd"], errors="coerce").fillna(0.0)
 
     total_return = float(pnl.iloc[-1] / total_notional_usd) if total_notional_usd else 0.0
@@ -627,19 +640,19 @@ def load_state_frame(state_path_str: str, mtime_ns: int) -> pd.DataFrame:
 @lru_cache(maxsize=32)
 def load_position_frame(state_path_str: str, mtime_ns: int) -> pd.DataFrame:
     state_path = Path(state_path_str)
-    for pos_col in ("position", "pos"):
+    for pos_col in ("pos", "position"):
         try:
             df = _read_parquet_frame(state_path, columns=["time", pos_col])
         except (KeyError, ValueError):
             continue
         if not {"time", pos_col}.issubset(df.columns):
             continue
-        df = df.rename(columns={pos_col: "position"})
+        df = df.rename(columns={pos_col: "pos"})
         df["time"] = pd.to_datetime(df["time"], unit="us", errors="coerce")
-        df["position"] = pd.to_numeric(df["position"], errors="coerce")
+        df["pos"] = pd.to_numeric(df["pos"], errors="coerce")
         df = df.dropna(subset=["time"]).sort_values("time")
         return df
-    return pd.DataFrame(columns=["time", "position"])
+    return pd.DataFrame(columns=["time", "pos"])
 
 
 @lru_cache(maxsize=32)
@@ -653,32 +666,38 @@ def load_daily_metrics_frame(state_path_str: str, mtime_ns: int) -> pd.DataFrame
                 return candidate
         return None
 
-    position_col = pick_first("position", "pos")
+    position_col = pick_first("pos", "position")
+    notional_col = pick_first("notional")
     pnl_col = pick_first("pnl", "net_pnl", "total_pnl")
     notional_raw_col = pick_first("notional_traded")
     notional_cum_col = pick_first("cum_notional_traded", "cumulative_notional_traded")
     size_raw_col = pick_first("size_traded")
     size_cum_col = pick_first("cum_size_traded", "cumulative_size_traded")
+    multiplier_col = pick_first("contract_multiplier")
 
     usecols = ["time"]
     for col in (
         position_col,
+        notional_col,
         pnl_col,
         notional_raw_col,
         notional_cum_col,
         size_raw_col,
         size_cum_col,
+        multiplier_col,
     ):
         if col and col not in usecols:
             usecols.append(col)
 
     if len(usecols) == 1:
-        return pd.DataFrame(columns=["time", "position", "pnl", "cum_notional_traded", "cum_size_traded"])
+        return pd.DataFrame(columns=["time", "pos", "pnl", "cum_notional_traded", "cum_size_traded"])
 
     df = _read_parquet_frame(state_path, columns=usecols)
     rename_map = {}
     if position_col:
-        rename_map[position_col] = "position"
+        rename_map[position_col] = "pos"
+    if notional_col:
+        rename_map[notional_col] = "notional"
     if pnl_col:
         rename_map[pnl_col] = "pnl"
     if notional_raw_col:
@@ -689,12 +708,14 @@ def load_daily_metrics_frame(state_path_str: str, mtime_ns: int) -> pd.DataFrame
         rename_map[size_raw_col] = "size_traded"
     if size_cum_col:
         rename_map[size_cum_col] = "cum_size_traded"
+    if multiplier_col:
+        rename_map[multiplier_col] = "contract_multiplier"
     df = df.rename(columns=rename_map)
 
     df["time"] = pd.to_datetime(df["time"], unit="us", errors="coerce")
     df = df.dropna(subset=["time"]).sort_values("time")
 
-    for col in ("position", "pnl", "notional_traded", "size_traded", "cum_notional_traded", "cum_size_traded"):
+    for col in ("pos", "notional", "pnl", "notional_traded", "size_traded", "cum_notional_traded", "cum_size_traded", "contract_multiplier"):
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors="coerce")
 
@@ -703,7 +724,7 @@ def load_daily_metrics_frame(state_path_str: str, mtime_ns: int) -> pd.DataFrame
     if "cum_size_traded" not in df.columns and "size_traded" in df.columns:
         df["cum_size_traded"] = df["size_traded"]
 
-    for col in ("position", "pnl", "cum_notional_traded", "cum_size_traded"):
+    for col in ("pos", "notional", "pnl", "cum_notional_traded", "cum_size_traded", "contract_multiplier"):
         if col not in df.columns:
             df[col] = pd.NA
     return df
@@ -1381,7 +1402,7 @@ def make_daily_figure(
     metrics_df = _minute_last_frame(metrics_df)
     state_df = _minute_last_frame(state_df)
     merged = pd.merge(
-        metrics_df[[col for col in ("time", "position", "pnl", "cum_notional_traded", "cum_size_traded") if col in metrics_df.columns]],
+        metrics_df[[col for col in ("time", "pos", "pnl", "cum_notional_traded", "cum_size_traded", "contract_multiplier", "cum_notional_usd") if col in metrics_df.columns]],
         state_df[[col for col in ("time", "bid", "ask") if col in state_df.columns]],
         on="time",
         how="inner",
@@ -1398,11 +1419,19 @@ def make_daily_figure(
     series = (
         (1, "notional_position", "#0F766E", False, "Notional Position"),
         (3, "cum_pnl", "#2563EB", False, "Cum PnL"),
-        (4, "cum_notional_traded", "#C2410C", False, "Cum Notional"),
+        (4, "cum_notional_usd", "#C2410C", False, "Cum Notional (USD)"),
     )
     if not merged.empty:
         merged["mid"] = (pd.to_numeric(merged["bid"], errors="coerce") + pd.to_numeric(merged["ask"], errors="coerce")) / 2.0
-        merged["notional_position"] = pd.to_numeric(merged["position"], errors="coerce") * merged["mid"]
+        merged["notional_position"] = pd.to_numeric(merged["pos"], errors="coerce") * merged["mid"]
+        if "contract_multiplier" in merged.columns:
+            merged["contract_multiplier"] = pd.to_numeric(merged["contract_multiplier"], errors="coerce").fillna(1.0)
+        else:
+            merged["contract_multiplier"] = 1.0
+        if "cum_notional_usd" in merged.columns and pd.to_numeric(merged["cum_notional_usd"], errors="coerce").notna().any():
+            merged["cum_notional_usd"] = pd.to_numeric(merged["cum_notional_usd"], errors="coerce")
+        else:
+            merged["cum_notional_usd"] = pd.to_numeric(merged.get("cum_size_traded"), errors="coerce").abs() * merged["mid"] * merged["contract_multiplier"]
         merged["pnl"] = pd.to_numeric(merged["pnl"], errors="coerce").fillna(0.0)
         if carry_pnl_across_days:
             merged["cum_pnl"] = merged["pnl"].cumsum()
@@ -1526,7 +1555,7 @@ def render_day(search: str) -> html.Div:
     available_hours = sorted({pd.to_datetime(o["start_ts_us"], unit="us").hour for o in orders})
 
     missing = []
-    for col in ("position", "pnl", "cum_notional_traded", "cum_size_traded"):
+    for col in ("pos", "pnl", "cum_notional_traded", "cum_size_traded"):
         if metrics_df[col].dropna().empty:
             missing.append(col)
 
@@ -1649,6 +1678,7 @@ def render_symbol(search: str) -> html.Div:
     total_fees_usd = 0.0
     total_notional_usd = 0.0
     cumulative_pnl_offset = 0.0
+    cumulative_notional_offset = 0.0
     for entry in state_entries:
         order_path = head / "log" / f"order.{entry.date}.parquet"
         if not order_path.exists():
@@ -1663,6 +1693,9 @@ def render_symbol(search: str) -> html.Div:
         report_df["pnl_delta"] = day_pnl_series.diff().fillna(day_pnl_series.iloc[0])
         report_df["pnl_cumulative"] = cumulative_pnl_offset + day_pnl_series
         cumulative_pnl_offset = float(report_df["pnl_cumulative"].iloc[-1])
+        day_notional_series = pd.to_numeric(report_df["cum_notional_usd"], errors="coerce").fillna(0.0)
+        report_df["cum_notional_usd"] = cumulative_notional_offset + day_notional_series
+        cumulative_notional_offset = float(report_df["cum_notional_usd"].iloc[-1])
         symbol_report_frames.append(report_df)
         day_total_fees_usd = load_total_fees(str(order_path), symbol, order_path.stat().st_mtime_ns) if order_path.exists() else 0.0
         day_total_notional_usd = _report_total_notional_usd(report_df)
@@ -1960,30 +1993,44 @@ def make_figure(
 
 def make_position_figure(
     position_df: pd.DataFrame,
+    state_df: pd.DataFrame,
     symbol: str,
     head: Path,
     date: str,
     initial_start: pd.Timestamp,
     initial_end: pd.Timestamp,
 ) -> go.Figure:
+    merged = pd.merge(
+        position_df[[col for col in ("time", "pos") if col in position_df.columns]],
+        state_df[[col for col in ("time", "bid", "ask") if col in state_df.columns]],
+        on="time",
+        how="inner",
+    )
+    if not merged.empty:
+        merged["mid"] = (pd.to_numeric(merged["bid"], errors="coerce") + pd.to_numeric(merged["ask"], errors="coerce")) / 2.0
+        merged["notional_position"] = pd.to_numeric(merged["pos"], errors="coerce") * merged["mid"]
+        merged = merged.dropna(subset=["notional_position"])
+    else:
+        merged = position_df.copy()
+        merged["notional_position"] = pd.to_numeric(merged.get("pos"), errors="coerce")
     fig = go.Figure()
     fig.add_trace(
         go.Scatter(
-            x=position_df["time"],
-            y=position_df["position"],
+            x=merged["time"],
+            y=merged["notional_position"],
             mode="lines",
-            name="Position",
+            name="Notional Position",
             line={"color": "#2a9d8f", "width": 1.8},
             line_shape="hv",
-            hovertemplate="position=%{y}<extra></extra>",
+            hovertemplate="notional_position=%{y}<extra></extra>",
         )
     )
     fig.update_xaxes(title="Time", range=[initial_start, initial_end], rangeslider={"visible": False}, type="date", domain=[0.05, 1.0])
-    fig.update_yaxes(title={"text": "Position", "standoff": 4}, side="left", position=0.05, automargin=True)
+    fig.update_yaxes(title={"text": "Notional Position (USD)", "standoff": 4}, side="left", position=0.05, automargin=True)
     fig.update_layout(
         template="plotly_white",
         height=140,
-        title="Position",
+        title="Notional Position",
         margin={"l": 42, "r": 20, "t": 60, "b": 40},
         hovermode="x unified",
     )
@@ -2061,7 +2108,7 @@ def render_chart(search: str) -> html.Div:
         detailed_orders=False,
         detailed_fills=False,
     )
-    position_fig = make_position_figure(position_window_df, symbol, head, date, window_start, window_end)
+    position_fig = make_position_figure(position_window_df, state_window_df, symbol, head, date, window_start, window_end)
     initial_interval_text = format_interval_label(window_start, window_end)
     return html.Div(
         [
@@ -2181,7 +2228,7 @@ def render_parent(search: str) -> html.Div:
         detailed_orders=True,
         detailed_fills=True,
     )
-    position_fig = make_position_figure(position_window_df, symbol, head, date, window_start, window_end)
+    position_fig = make_position_figure(position_window_df, state_window_df, symbol, head, date, window_start, window_end)
     initial_interval_text = format_interval_label(window_start, window_end)
     hourly_href = (
         f"/chart?head={quote(str(head))}&symbol={quote(symbol)}&date={date}"
