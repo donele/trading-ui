@@ -17,6 +17,16 @@ python3 app.py
 
 Open `http://127.0.0.1:8050`.
 
+## SimData Dashboard
+
+The second dashboard variant uses `SimData` from `app2.py` and Plotly Dash:
+
+```bash
+python3 sim_dashboard/app2_dash.py
+```
+
+It defaults to `http://127.0.0.1:8051` and can be overridden with `DASH2_PORT`.
+
 ## Data roots
 
 The app scans:
