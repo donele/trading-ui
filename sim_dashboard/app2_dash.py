@@ -65,6 +65,20 @@ def state_files_for_head(head: Path):
     return rows
 
 
+def order_parquet_dates_for_head(head: Path) -> set[str]:
+    log_dir = head / "log"
+    if not log_dir.is_dir():
+        return set()
+    dates: set[str] = set()
+    for path in log_dir.glob("order.????????.parquet"):
+        parts = path.name.split(".")
+        if len(parts) == 3 and parts[0] == "order" and parts[2] == "parquet":
+            date = parts[1]
+            if len(date) == 8 and date.isdigit():
+                dates.add(date)
+    return dates
+
+
 def discover_heads() -> dict[str, list[Path]]:
     grouped: dict[str, list[Path]] = {name: [] for name in ROOT_ORDER}
     for root_name, root in zip(ROOT_ORDER, ROOTS):
@@ -802,10 +816,12 @@ def render_index() -> html.Div:
         head_cards = []
         for head in heads:
             files = state_files_for_head(head)
+            order_dates = order_parquet_dates_for_head(head)
             by_symbol: dict[str, list[str]] = defaultdict(list)
             for row in files:
-                by_symbol[row["symbol"]].append(row["date"])
-            all_dates = sorted({row["date"] for row in files})
+                if row["date"] in order_dates:
+                    by_symbol[row["symbol"]].append(row["date"])
+            all_dates = sorted({row["date"] for row in files if row["date"] in order_dates})
             symbol_items = []
             if len(by_symbol) > 1 and all_dates:
                 symbol_items.append(
@@ -831,6 +847,8 @@ def render_index() -> html.Div:
                 )
             for symbol, dates in sorted(by_symbol.items()):
                 dates = sorted(set(dates))
+                if not dates:
+                    continue
                 latest_date = dates[-1]
                 links = [
                     html.A(
